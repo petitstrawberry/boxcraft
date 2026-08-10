@@ -280,6 +280,21 @@ impl Mat4 {
         Self { columns: result }
     }
 
+    /// Returns this transform with its clip-space Y axis inverted.
+    ///
+    /// SGFX uses an upper-left viewport convention, so conventional OpenGL
+    /// perspective transforms need this adjustment before submission.
+    ///
+    /// # Returns
+    ///
+    /// A matrix whose clip-space Y output is the negative of this matrix.
+    pub fn with_inverted_clip_y(mut self) -> Self {
+        for index in [1usize, 5, 9, 13] {
+            self.columns[index] = -self.columns[index];
+        }
+        self
+    }
+
     /// Transforms a position with homogeneous w=1.
     ///
     /// # Arguments
@@ -1208,5 +1223,15 @@ mod tests {
             Player::new(Vec3::zero()).camera().forward(),
             Vec3::new(0.0, 0.0, -1.0)
         );
+
+        let projection = Mat4::perspective_rh_gl(core::f32::consts::FRAC_PI_2, 1.0, 0.05, 128.0);
+        let point_above_camera = Vec3::new(0.0, 1.0, -2.0);
+        let gl_clip = projection.transform_point(point_above_camera);
+        let sgfx_clip = projection
+            .with_inverted_clip_y()
+            .transform_point(point_above_camera);
+        assert!(gl_clip.y > 0.0);
+        assert!(sgfx_clip.y < 0.0);
+        assert!((gl_clip.z - sgfx_clip.z).abs() < 0.0001);
     }
 }

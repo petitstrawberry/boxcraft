@@ -1,0 +1,16 @@
+[package]
+name = "boxcraft"
+version = "0.1.0"
+edition = "2024"
+description = "A ScarletUI and SGFX voxel sandbox for Scarlet OS"
+license = "MIT"
+
+[dependencies]
+boxcraft-core = { path = "../boxcraft-core" }
+
+[target.'cfg(target_os = "scarlet")'.dependencies]
+scarlet-ui = { git = "https://github.com/petitstrawberry/scarlet-ui", rev = "34106d544fa3bbdc547545eff0d14514e8834408", package = "scarlet-ui", default-features = false, features = ["std", "platform-sws"] }
+
+[[bin]]
+name = "boxcraft"
+path = "src/main.rs"

@@ -1,0 +1,8 @@
+[package]
+name = "boxcraft-core"
+version = "0.1.0"
+edition = "2024"
+description = "Pure-Rust voxel world, meshing, and first-person game domain for Boxcraft"
+license = "MIT"
+
+[dependencies]

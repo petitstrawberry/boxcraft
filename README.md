@@ -14,7 +14,17 @@ The workspace follows the same split used by Vellum:
 - `boxcraft-core` is the dependency-free game domain: deterministic terrain,
   visible-face meshing, raycasts, player physics, and camera matrices.
 - `boxcraft` is the ScarletUI application crate. It translates the core mesh
-  into an SGFX triangle list and owns window/input integration.
+  into a textured SGFX triangle list and owns window/input integration.
+
+## Terrain rendering
+
+The frontend builds one small procedural RGBA8 pixel-art atlas at startup. Core
+mesh vertices provide a material, normalized atlas UV, sky-light, and
+ambient-occlusion value; the frontend uses that metadata to sample the grass,
+dirt, stone, wood, leaves, sand, and water tiles. A slowly moving directional
+sun is combined with the baked occlusion and sky ambient light before each
+retained mesh update, so the same textured terrain shifts naturally from sunrise
+through night without changing the camera, depth-tested frame, or input path.
 
 External framework dependencies are Git dependencies. In particular, ScarletUI
 is fetched from `https://github.com/petitstrawberry/scarlet-ui`; the manifest
@@ -91,10 +101,11 @@ or launcher integration.
 ## ScarletUI requirements
 
 Boxcraft requires a ScarletUI revision with the SGFX depth-tested canvas,
-stable dynamic mesh handles and revisions, SWS pointer lock, relative pointer
-motion, and mouse-button view modifiers. Terrain edits publish a new revision
-of one stable mesh handle; normal frames reuse that mesh and only update the
-camera transform.
+stable dynamic mesh handles and revisions, retained RGBA8 textures with
+per-vertex texture coordinates, SWS pointer lock, relative pointer motion, and
+mouse-button view modifiers. Terrain edits publish a new revision of one stable
+mesh handle; normal frames reuse that mesh and only update the camera transform,
+with a lightweight lighting revision as the day cycle advances.
 
 ## License
 

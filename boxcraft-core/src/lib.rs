@@ -322,6 +322,8 @@ pub enum Block {
     Leaves,
     /// Sandy shoreline material.
     Sand,
+    /// Non-colliding water used to fill terrain below sea level.
+    Water,
 }
 
 impl Block {
@@ -329,8 +331,19 @@ impl Block {
     ///
     /// # Returns
     ///
-    /// `true` for every block except [`Block::Air`].
+    /// `true` for blocks that stop movement, excluding air and water.
     pub const fn is_solid(self) -> bool {
+        !matches!(self, Self::Air | Self::Water)
+    }
+
+    /// Returns whether the block contributes faces to a terrain mesh.
+    ///
+    /// # Returns
+    ///
+    /// `true` for every material except [`Block::Air`]. Water is renderable even
+    /// though it is not solid, allowing the world to have a visible sea without
+    /// changing player collision behaviour.
+    pub const fn is_renderable(self) -> bool {
         !matches!(self, Self::Air)
     }
 
@@ -348,9 +361,13 @@ impl Block {
             Self::Wood => [0.38, 0.22, 0.10, 1.0],
             Self::Leaves => [0.16, 0.48, 0.16, 1.0],
             Self::Sand => [0.76, 0.67, 0.39, 1.0],
+            Self::Water => [0.08, 0.34, 0.72, 0.82],
         }
     }
 }
+
+/// Height of the still-water surface in generated worlds.
+pub const SEA_LEVEL: i32 = 5;
 
 /// A finite, densely stored voxel world.
 #[derive(Clone, Debug, PartialEq)]
@@ -391,7 +408,7 @@ impl World {
         Self::new(32, 16, 32)
     }
 
-    /// Generates deterministic terrain from `seed`, including a few trees.
+    /// Generates deterministic terrain from `seed`, including coasts and trees.
     ///
     /// # Arguments
     ///
@@ -419,19 +436,12 @@ impl World {
                     };
                     world.set(IVec3::new(x, y, z), block);
                 }
-            }
-        }
-        for z in 2..world.depth as i32 - 2 {
-            for x in 2..world.width as i32 - 2 {
-                let ground = terrain_height(seed, x, z);
-                if ground > 5
-                    && ground + 5 < world.height as i32
-                    && hash(seed ^ 0xA1B2_C3D4, x, z).is_multiple_of(29)
-                {
-                    world.add_tree(IVec3::new(x, ground + 1, z));
+                for y in height + 1..=SEA_LEVEL.min(world.height as i32 - 1) {
+                    world.set(IVec3::new(x, y, z), Block::Water);
                 }
             }
         }
+        world.populate_trees(seed);
         world
     }
 
@@ -610,13 +620,73 @@ impl World {
         }
     }
 
-    fn add_tree(&mut self, base: IVec3) {
-        for y in 0..3 {
+    fn populate_trees(&mut self, seed: u64) {
+        const TREE_CELL_SIZE: i32 = 5;
+        const CANOPY_RADIUS: i32 = 2;
+        let cells_x = (self.width as i32 + TREE_CELL_SIZE - 1) / TREE_CELL_SIZE;
+        let cells_z = (self.depth as i32 + TREE_CELL_SIZE - 1) / TREE_CELL_SIZE;
+
+        for cell_z in 0..cells_z {
+            for cell_x in 0..cells_x {
+                let choice = hash(seed ^ 0xA1B2_C3D4_E5F6_0718, cell_x, cell_z);
+                // One sampled candidate per coarse cell prevents the noisy, evenly
+                // distributed forest that independent per-block rolls produce.
+                if choice % 100 >= 58 {
+                    continue;
+                }
+                let x = cell_x * TREE_CELL_SIZE + ((choice >> 8) % TREE_CELL_SIZE as u64) as i32;
+                let z = cell_z * TREE_CELL_SIZE + ((choice >> 16) % TREE_CELL_SIZE as u64) as i32;
+                if x < CANOPY_RADIUS
+                    || z < CANOPY_RADIUS
+                    || x >= self.width as i32 - CANOPY_RADIUS
+                    || z >= self.depth as i32 - CANOPY_RADIUS
+                {
+                    continue;
+                }
+
+                let ground = terrain_height(seed, x, z);
+                let trunk_height = 3 + ((choice >> 24) & 1) as i32;
+                if ground <= SEA_LEVEL
+                    || ground + trunk_height + 2 >= self.height as i32
+                    || self.block(IVec3::new(x, ground, z)) != Some(Block::Grass)
+                    || !self.tree_site_is_gentle(seed, x, z)
+                {
+                    continue;
+                }
+                self.add_tree(IVec3::new(x, ground + 1, z), trunk_height);
+            }
+        }
+    }
+
+    fn tree_site_is_gentle(&self, seed: u64, x: i32, z: i32) -> bool {
+        let height = terrain_height(seed, x, z);
+        [
+            IVec3::new(-1, 0, 0),
+            IVec3::new(1, 0, 0),
+            IVec3::new(0, 0, -1),
+            IVec3::new(0, 0, 1),
+        ]
+        .into_iter()
+        .all(|offset| (terrain_height(seed, x + offset.x, z + offset.z) - height).abs() <= 1)
+    }
+
+    fn add_tree(&mut self, base: IVec3, trunk_height: i32) {
+        for y in 0..trunk_height {
             self.set(base + IVec3::new(0, y, 0), Block::Wood);
         }
-        for y in 2..5 {
-            for z in -1..=1 {
-                for x in -1..=1 {
+
+        let canopy_base = trunk_height - 2;
+        for y in canopy_base..=trunk_height + 1 {
+            let radius: i32 = match y - canopy_base {
+                0 | 3 => 1,
+                _ => 2,
+            };
+            for z in -radius..=radius {
+                for x in -radius..=radius {
+                    // Round the broad canopy corners and leave its trunk visible.
+                    if x.abs() + z.abs() > radius + 1 || (x == 0 && z == 0 && y < trunk_height) {
+                        continue;
+                    }
                     let position = base + IVec3::new(x, y, z);
                     if self.block(position) == Some(Block::Air) {
                         self.set(position, Block::Leaves);
@@ -649,6 +719,12 @@ pub struct Vertex {
     pub color: [f32; 4],
     /// Source material, useful for atlas-based renderers.
     pub block: Block,
+    /// Normalized texture coordinate in the built-in four-by-three block atlas.
+    pub atlas_uv: [f32; 2],
+    /// Corner ambient-occlusion multiplier, from dark (`0.46`) to unoccluded (`1.0`).
+    pub ambient_occlusion: f32,
+    /// Directional sky-light multiplier for this corner, from `0.0` to `1.0`.
+    pub light: f32,
 }
 
 /// Triangulated exposed faces of a [`World`].
@@ -670,6 +746,7 @@ pub struct Mesh {
 ///
 /// A triangle mesh with one quad for each air-adjacent block face.
 pub fn mesh_world(world: &World) -> Mesh {
+    const FACE_UVS: [[f32; 2]; 4] = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
     const FACES: [(IVec3, [Vec3; 4]); 6] = [
         (
             IVec3::new(-1, 0, 0),
@@ -731,23 +808,31 @@ pub fn mesh_world(world: &World) -> Mesh {
         for z in 0..world.depth as i32 {
             for x in 0..world.width as i32 {
                 let position = IVec3::new(x, y, z);
-                let Some(block) = world.block(position).filter(|block| block.is_solid()) else {
+                let Some(block) = world.block(position).filter(|block| block.is_renderable())
+                else {
                     continue;
                 };
                 for (normal, corners) in FACES {
                     if world
                         .block(position + normal)
-                        .is_none_or(|neighbor| !neighbor.is_solid())
+                        .is_none_or(|neighbor| !neighbor.is_renderable())
                     {
                         let first = mesh.vertices.len() as u32;
                         let offset = Vec3::new(x as f32, y as f32, z as f32);
                         let normal = Vec3::new(normal.x as f32, normal.y as f32, normal.z as f32);
-                        mesh.vertices.extend(corners.map(|corner| Vertex {
-                            position: offset + corner,
-                            normal,
-                            color: block.color(),
-                            block,
-                        }));
+                        for (corner, uv) in corners.into_iter().zip(FACE_UVS) {
+                            mesh.vertices.push(Vertex {
+                                position: offset + corner,
+                                normal,
+                                color: block.color(),
+                                block,
+                                atlas_uv: atlas_uv(block, normal, uv),
+                                ambient_occlusion: vertex_ambient_occlusion(
+                                    world, position, normal, corner,
+                                ),
+                                light: vertex_light(world, position, normal, corner),
+                            });
+                        }
                         mesh.indices.extend_from_slice(&[
                             first,
                             first + 1,
@@ -762,6 +847,84 @@ pub fn mesh_world(world: &World) -> Mesh {
         }
     }
     mesh
+}
+
+fn atlas_uv(block: Block, normal: Vec3, local_uv: [f32; 2]) -> [f32; 2] {
+    const ATLAS_COLUMNS: f32 = 4.0;
+    const ATLAS_ROWS: f32 = 3.0;
+    let tile = match block {
+        Block::Air => [0.0, 0.0],
+        Block::Grass if normal.y > 0.0 => [0.0, 0.0],
+        Block::Grass if normal.y < 0.0 => [2.0, 0.0],
+        Block::Grass => [1.0, 0.0],
+        Block::Dirt => [2.0, 0.0],
+        Block::Stone => [3.0, 0.0],
+        Block::Wood if normal.y == 0.0 => [0.0, 1.0],
+        Block::Wood => [1.0, 1.0],
+        Block::Leaves => [2.0, 1.0],
+        Block::Sand => [3.0, 1.0],
+        Block::Water => [0.0, 2.0],
+    };
+    [
+        (tile[0] + local_uv[0]) / ATLAS_COLUMNS,
+        (tile[1] + local_uv[1]) / ATLAS_ROWS,
+    ]
+}
+
+fn vertex_ambient_occlusion(world: &World, position: IVec3, normal: Vec3, corner: Vec3) -> f32 {
+    let normal = IVec3::new(normal.x as i32, normal.y as i32, normal.z as i32);
+    let mut sides = [false; 2];
+    let mut side_count = 0;
+    let mut diagonal = IVec3::default();
+    for (axis, corner_component) in [(0, corner.x), (1, corner.y), (2, corner.z)] {
+        if [normal.x, normal.y, normal.z][axis] != 0 {
+            continue;
+        }
+        let direction = if corner_component < 0.5 { -1 } else { 1 };
+        let offset = match axis {
+            0 => IVec3::new(direction, 0, 0),
+            1 => IVec3::new(0, direction, 0),
+            _ => IVec3::new(0, 0, direction),
+        };
+        sides[side_count] = world
+            .block(position + normal + offset)
+            .is_some_and(Block::is_solid);
+        diagonal = diagonal + offset;
+        side_count += 1;
+    }
+    debug_assert_eq!(side_count, 2);
+    let corner_is_occluded = world
+        .block(position + normal + diagonal)
+        .is_some_and(Block::is_solid);
+    let occluders = if sides[0] && sides[1] {
+        3
+    } else {
+        sides.into_iter().filter(|side| *side).count() as i32 + corner_is_occluded as i32
+    };
+    1.0 - occluders as f32 * 0.18
+}
+
+fn vertex_light(world: &World, position: IVec3, normal: Vec3, corner: Vec3) -> f32 {
+    let sample = IVec3::new(
+        position.x + (corner.x >= 1.0) as i32,
+        position.y + 1,
+        position.z + (corner.z >= 1.0) as i32,
+    );
+    let sky_visible = (sample.y..world.height as i32).all(|y| {
+        world
+            .block(IVec3::new(sample.x, y, sample.z))
+            .is_none_or(|block| !block.is_solid())
+    });
+    let face_light = if normal.y > 0.0 {
+        1.0
+    } else if normal.y < 0.0 {
+        0.52
+    } else if normal.x > 0.0 || normal.z > 0.0 {
+        0.82
+    } else {
+        0.68
+    };
+    face_light * if sky_visible { 1.0 } else { 0.64 }
 }
 
 /// A first-person camera derived from a player's head position and rotation.
@@ -1082,9 +1245,52 @@ fn hash(seed: u64, x: i32, z: i32) -> u64 {
 }
 
 fn terrain_height(seed: u64, x: i32, z: i32) -> i32 {
-    let coarse = (hash(seed, x.div_euclid(4), z.div_euclid(4)) % 4) as i32;
-    let detail = (hash(seed ^ 0x55AA, x, z) % 3) as i32 - 1;
-    (6 + coarse + detail).clamp(3, 11)
+    // A wide, smooth continental signal establishes beaches and ocean basins.
+    // Smaller octaves add rolling hills without creating one-block noise spikes.
+    let continent = value_noise(seed ^ 0xF135_7AEA_2E62_A9C5, x, z, 24);
+    let rolling = value_noise(seed ^ 0x8D58_AC26_AA16_3A41, x, z, 12) * 0.62
+        + value_noise(seed ^ 0x7B29_4D0F_91D7_05B3, x, z, 6) * 0.28
+        + value_noise(seed ^ 0x4CF5_AD43_2745_937F, x, z, 3) * 0.10;
+    // Positive continental regions receive a little extra relief, while ocean
+    // basins remain broad enough to make coastlines legible in a small world.
+    let upland = ((continent + 1.0) * 0.5).powi(2) * 1.6;
+    (SEA_LEVEL as f32 + 1.15 + continent * 3.75 + rolling * 2.15 + upland)
+        .round()
+        .clamp(1.0, 11.0) as i32
+}
+
+fn value_noise(seed: u64, x: i32, z: i32, wavelength: i32) -> f32 {
+    debug_assert!(wavelength > 0);
+    let grid_x = x.div_euclid(wavelength);
+    let grid_z = z.div_euclid(wavelength);
+    let local_x = x.rem_euclid(wavelength) as f32 / wavelength as f32;
+    let local_z = z.rem_euclid(wavelength) as f32 / wavelength as f32;
+    let blend_x = smoothstep(local_x);
+    let blend_z = smoothstep(local_z);
+    let north = lerp(
+        hash_to_unit(seed, grid_x, grid_z),
+        hash_to_unit(seed, grid_x + 1, grid_z),
+        blend_x,
+    );
+    let south = lerp(
+        hash_to_unit(seed, grid_x, grid_z + 1),
+        hash_to_unit(seed, grid_x + 1, grid_z + 1),
+        blend_x,
+    );
+    lerp(north, south, blend_z)
+}
+
+fn hash_to_unit(seed: u64, x: i32, z: i32) -> f32 {
+    let bits = (hash(seed, x, z) >> 40) as u32;
+    bits as f32 / ((1_u32 << 24) - 1) as f32 * 2.0 - 1.0
+}
+
+fn smoothstep(value: f32) -> f32 {
+    value * value * (3.0 - 2.0 * value)
+}
+
+fn lerp(from: f32, to: f32, amount: f32) -> f32 {
+    from + (to - from) * amount
 }
 
 fn sign(value: f32) -> i32 {
@@ -1115,12 +1321,66 @@ fn initial_t(origin: f32, direction: f32, step: i32) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Block, IVec3, Mat4, Player, PlayerInput, Vec3, World, mesh_world};
+    use super::{
+        Block, IVec3, Mat4, Player, PlayerInput, SEA_LEVEL, Vec3, World, mesh_world, terrain_height,
+    };
 
     #[test]
     fn generation_is_deterministic() {
         assert_eq!(World::generate(42), World::generate(42));
         assert_ne!(World::generate(42), World::generate(43));
+    }
+
+    #[test]
+    fn generated_terrain_is_bounded_and_includes_a_coastline() {
+        let world = World::generate(42);
+        let (width, height, depth) = world.dimensions();
+        let mut water = 0;
+        let mut sand = 0;
+        for z in 0..depth as i32 {
+            for x in 0..width as i32 {
+                let mut highest = None;
+                for y in 0..height as i32 {
+                    let block = world.block(IVec3::new(x, y, z)).unwrap();
+                    water += (block == Block::Water) as usize;
+                    sand += (block == Block::Sand) as usize;
+                    if block.is_renderable() {
+                        highest = Some(y);
+                    }
+                }
+                assert!(highest.is_some_and(|y| y < height as i32));
+            }
+        }
+        assert!(
+            water > 0,
+            "seed should create a visible sea at level {SEA_LEVEL}"
+        );
+        assert!(sand > 0, "sea-adjacent terrain should create sandy beaches");
+    }
+
+    #[test]
+    fn terrain_uses_multiple_smooth_height_octaves_and_natural_trees() {
+        let mut levels = [false; 12];
+        for z in 0..32 {
+            for x in 0..32 {
+                levels[terrain_height(42, x, z) as usize] = true;
+            }
+        }
+        assert!(levels.into_iter().filter(|present| *present).count() >= 5);
+
+        let world = World::generate(42);
+        let wood = world
+            .blocks
+            .iter()
+            .filter(|block| **block == Block::Wood)
+            .count();
+        let leaves = world
+            .blocks
+            .iter()
+            .filter(|block| **block == Block::Leaves)
+            .count();
+        assert!(wood >= 3);
+        assert!(leaves > wood);
     }
 
     #[test]
@@ -1132,6 +1392,46 @@ mod tests {
         let mesh = mesh_world(&world);
         assert_eq!(mesh.vertices.len(), 40);
         assert_eq!(mesh.indices.len(), 60);
+    }
+
+    #[test]
+    fn mesh_supplies_atlas_uvs_and_corner_shading_metadata() {
+        let mut world = World::new(4, 4, 4);
+        world.set(IVec3::new(1, 1, 1), Block::Stone);
+        // These two blocks meet one top-face corner and must darken it.
+        world.set(IVec3::new(0, 2, 1), Block::Stone);
+        world.set(IVec3::new(1, 2, 0), Block::Stone);
+        let mesh = mesh_world(&world);
+        assert!(mesh.vertices.iter().all(|vertex| {
+            vertex.atlas_uv[0] >= 0.0
+                && vertex.atlas_uv[0] <= 1.0
+                && vertex.atlas_uv[1] >= 0.0
+                && vertex.atlas_uv[1] <= 1.0
+                && vertex.ambient_occlusion > 0.0
+                && vertex.ambient_occlusion <= 1.0
+                && vertex.light > 0.0
+                && vertex.light <= 1.0
+        }));
+        let darkest_top_corner = mesh
+            .vertices
+            .iter()
+            .filter(|vertex| vertex.position.y == 2.0 && vertex.normal.y == 1.0)
+            .map(|vertex| vertex.ambient_occlusion)
+            .fold(1.0_f32, f32::min);
+        assert!(darkest_top_corner < 1.0);
+    }
+
+    #[test]
+    fn water_is_meshable_without_becoming_collision_solid() {
+        let mut world = World::new(2, 2, 2);
+        world.set(IVec3::new(0, 0, 0), Block::Water);
+        assert!(!Block::Water.is_solid());
+        assert!(
+            mesh_world(&world)
+                .vertices
+                .iter()
+                .any(|vertex| vertex.block == Block::Water)
+        );
     }
 
     #[test]

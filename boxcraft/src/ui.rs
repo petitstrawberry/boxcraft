@@ -3,12 +3,12 @@
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use boxcraft_core::{Block, Game, Mat4, PlayerInput, Vec3, mesh_world};
+use boxcraft_core::{Block, Game, Mat4, Mesh, PlayerInput, Vec3, mesh_world};
 use scarlet_ui::prelude::*;
 use scarlet_ui::{
     ApplicationRunExt, ComponentElement, HeaderBar, KeyCode, KeyEvent, MouseButton, PlatformWindow,
     SgfxCanvas, SgfxCanvasDraw, SgfxCanvasFrame, SgfxCanvasHandle, SgfxCanvasVertex, SgfxMesh,
-    SgfxMeshHandle, hstack, vstack, zstack,
+    SgfxMeshHandle, SgfxTexture, hstack, vstack, zstack,
 };
 
 const APP_ID: &str = "org.scarlet-os.boxcraft";
@@ -19,6 +19,11 @@ const CAMERA_FOV: f32 = 70.0_f32.to_radians();
 const REACH: f32 = 6.0;
 const LOOK_SENSITIVITY: f32 = 0.003;
 const WORLD_SEED: u64 = 0xB0CA_FE00_2026_0001;
+const ATLAS_TILE_SIZE: u32 = 16;
+const ATLAS_COLUMNS: u32 = 4;
+const ATLAS_ROWS: u32 = 3;
+const DAY_LENGTH_SECONDS: f32 = 150.0;
+const SUNLIGHT_UPDATES_PER_SECOND: f32 = 8.0;
 
 /// Run the Boxcraft application.
 ///
@@ -55,6 +60,8 @@ struct Runtime {
     last_idle: Instant,
     fps_sample_start: Instant,
     frames_since_sample: u32,
+    day_seconds: f32,
+    sunlight_step: u64,
 }
 
 impl Runtime {
@@ -64,6 +71,8 @@ impl Runtime {
             last_idle: now,
             fps_sample_start: now,
             frames_since_sample: 0,
+            day_seconds: 0.0,
+            sunlight_step: 0,
         }
     }
 }
@@ -80,9 +89,11 @@ struct BoxcraftApp {
     fullscreen_applied: State<bool>,
     fullscreen_pending: State<bool>,
     canvas_frame: State<Arc<SgfxCanvasFrame>>,
+    terrain_mesh: State<Arc<Mesh>>,
     mesh: State<Option<Arc<SgfxMesh>>>,
     mesh_revision: State<u64>,
     frame_revision: State<u64>,
+    sun_phase: State<f32>,
     fps: State<u32>,
     fps_text: State<String>,
     position: State<String>,
@@ -90,6 +101,7 @@ struct BoxcraftApp {
     status: State<String>,
     canvas_handle: SgfxCanvasHandle,
     mesh_handle: SgfxMeshHandle,
+    block_atlas: Arc<SgfxTexture>,
     runtime: Arc<Mutex<Runtime>>,
 }
 
@@ -114,9 +126,11 @@ impl BoxcraftApp {
             fullscreen_applied: State::new(StateId::new(8), false),
             fullscreen_pending: State::new(StateId::new(9), false),
             canvas_frame: State::new(StateId::new(10), initial_frame),
+            terrain_mesh: State::new(StateId::new(19), Arc::new(Mesh::default())),
             mesh: State::new(StateId::new(11), None),
             mesh_revision: State::new(StateId::new(12), 0),
             frame_revision: State::new(StateId::new(13), 0),
+            sun_phase: State::new(StateId::new(20), 0.0),
             fps: State::new(StateId::new(14), 0),
             fps_text: State::new(StateId::new(15), String::from("FPS: 0")),
             position: State::new(StateId::new(16), String::from("Position: loading")),
@@ -127,6 +141,7 @@ impl BoxcraftApp {
             ),
             canvas_handle: SgfxCanvasHandle::new(),
             mesh_handle: SgfxMeshHandle::new(),
+            block_atlas: block_texture_atlas(),
             runtime: Arc::new(Mutex::new(Runtime::new())),
         };
         app.rebuild_mesh();
@@ -287,16 +302,41 @@ impl BoxcraftApp {
     }
 
     fn rebuild_mesh(&self) {
-        let core_mesh = self.with_game(|game| mesh_world(&game.world));
+        self.terrain_mesh
+            .set(Arc::new(self.with_game(|game| mesh_world(&game.world))));
+        self.rebuild_render_mesh();
+        self.refresh_frame();
+    }
+
+    /// Rebuild the retained SGFX mesh from the latest terrain snapshot.
+    ///
+    /// Terrain supplies local UVs, material identity, and ambient-occlusion
+    /// light. The frontend maps those values into the pixel atlas and applies
+    /// the current moving sun before handing the triangle list to SGFX.
+    fn rebuild_render_mesh(&self) {
+        let core_mesh = self.terrain_mesh.get();
+        let sun_phase = self.sun_phase.get();
         let mut vertices = Vec::with_capacity(core_mesh.indices.len());
-        for index in core_mesh.indices {
+        for &index in &core_mesh.indices {
             let Some(vertex) = core_mesh.vertices.get(index as usize) else {
                 continue;
             };
-            vertices.push(SgfxCanvasVertex::new(
-                [vertex.position.x, vertex.position.y, vertex.position.z, 1.0],
-                shaded_block_color(vertex.color, vertex.normal),
-            ));
+            vertices.push(
+                SgfxCanvasVertex::new(
+                    [vertex.position.x, vertex.position.y, vertex.position.z, 1.0],
+                    sunlight_color(
+                        vertex.normal,
+                        vertex.light,
+                        vertex.ambient_occlusion,
+                        sun_phase,
+                    ),
+                )
+                .with_tex_coord(atlas_tex_coord(
+                    vertex.block,
+                    vertex.normal,
+                    vertex.atlas_uv,
+                )),
+            );
         }
         self.mesh_revision
             .update(|revision| *revision = revision.wrapping_add(1));
@@ -304,7 +344,6 @@ impl BoxcraftApp {
         let mesh = (!vertices.is_empty())
             .then(|| SgfxMesh::with_handle(self.mesh_handle, revision, vertices));
         self.mesh.set(mesh);
-        self.refresh_frame();
     }
 
     fn refresh_frame(&self) {
@@ -322,7 +361,8 @@ impl BoxcraftApp {
                 // The SGFX renderer corrects this reference perspective as its canvas resizes.
                 .reference_aspect(REFERENCE_ASPECT);
         if let Some(mesh) = self.mesh.get() {
-            frame = frame.draw(SgfxCanvasDraw::new(mesh, transform));
+            frame = frame
+                .draw(SgfxCanvasDraw::new(mesh, transform).texture(Arc::clone(&self.block_atlas)));
         }
         self.canvas_frame.set(Arc::new(frame));
     }
@@ -496,7 +536,7 @@ impl Application for BoxcraftApp {
 
     fn on_idle(&mut self) {
         let now = Instant::now();
-        let (delta_seconds, fps) = {
+        let (delta_seconds, fps, sun_phase) = {
             let mut runtime = match self.runtime.lock() {
                 Ok(runtime) => runtime,
                 Err(poisoned) => poisoned.into_inner(),
@@ -506,6 +546,12 @@ impl Application for BoxcraftApp {
                 .as_secs_f32()
                 .min(0.1);
             runtime.last_idle = now;
+            runtime.day_seconds += delta_seconds;
+            let sunlight_step = (runtime.day_seconds * SUNLIGHT_UPDATES_PER_SECOND) as u64;
+            let sun_phase = (sunlight_step != runtime.sunlight_step).then(|| {
+                runtime.sunlight_step = sunlight_step;
+                (runtime.day_seconds / DAY_LENGTH_SECONDS).rem_euclid(1.0)
+            });
             runtime.frames_since_sample = runtime.frames_since_sample.saturating_add(1);
             let elapsed = now.saturating_duration_since(runtime.fps_sample_start);
             let fps = (elapsed.as_millis() >= 500).then(|| {
@@ -516,7 +562,7 @@ impl Application for BoxcraftApp {
                 runtime.fps_sample_start = now;
                 fps
             });
-            (delta_seconds, fps)
+            (delta_seconds, fps, sun_phase)
         };
 
         let input = self.keys.get().player_input();
@@ -528,6 +574,10 @@ impl Application for BoxcraftApp {
                 game.player.grounded = false;
             }
         });
+        if let Some(sun_phase) = sun_phase {
+            self.sun_phase.set(sun_phase);
+            self.rebuild_render_mesh();
+        }
         if let Some(fps) = fps {
             self.fps.set(fps);
             self.fps_text.set(format!("FPS: {fps}"));
@@ -552,19 +602,141 @@ fn build_boxcraft_content(app: &BoxcraftApp) -> Box<dyn View> {
     Box::new(app.content())
 }
 
-fn shaded_block_color(color: [f32; 4], normal: Vec3) -> [f32; 4] {
-    let shade = if normal.y > 0.5 {
-        1.0
-    } else if normal.y < -0.5 {
-        0.55
-    } else {
-        0.78
+/// Create the compact RGBA8 atlas used by every visible terrain block.
+///
+/// The small, procedural tiles deliberately have hard pixel edges: they stay
+/// readable at a distance without depending on an external asset pipeline.
+fn block_texture_atlas() -> Arc<SgfxTexture> {
+    let width = ATLAS_COLUMNS * ATLAS_TILE_SIZE;
+    let height = ATLAS_ROWS * ATLAS_TILE_SIZE;
+    let mut pixels = Vec::with_capacity((width * height * 4) as usize);
+    for y in 0..height {
+        for x in 0..width {
+            let tile = (x / ATLAS_TILE_SIZE + (y / ATLAS_TILE_SIZE) * ATLAS_COLUMNS) as usize;
+            let color = atlas_pixel(tile, x % ATLAS_TILE_SIZE, y % ATLAS_TILE_SIZE);
+            pixels.extend_from_slice(&color);
+        }
+    }
+    SgfxTexture::rgba8(width, height, pixels)
+}
+
+fn atlas_pixel(tile: usize, x: u32, y: u32) -> [u8; 4] {
+    let noise = pixel_noise(tile as u32, x, y);
+    let shade = match noise & 0b11 {
+        0 => -12,
+        1 => -4,
+        2 => 4,
+        _ => 10,
     };
+    let mut color = match tile {
+        // Grass top: rich blades with sparse dry speckles.
+        0 if noise % 19 == 0 => [118, 142, 56],
+        0 => [70, 143, 56],
+        // Grass sides have a short turf cap over soil.
+        1 if y < 4 || (y == 4 && noise % 3 != 0) => [68, 140, 55],
+        1 => [124, 77, 43],
+        // Dirt.
+        2 => [126, 78, 44],
+        // Stone, with occasional darker fracture pixels.
+        3 if (x + y * 3) % 11 == 0 || noise % 23 == 0 => [87, 94, 102],
+        3 => [119, 126, 132],
+        // Wood bark: vertical dark grain.
+        4 if x % 5 == 0 || (x + y) % 13 == 0 => [76, 48, 28],
+        4 => [133, 85, 43],
+        // Wood end grain: a simple square ring.
+        5 if x
+            .min(y)
+            .min(ATLAS_TILE_SIZE - 1 - x)
+            .min(ATLAS_TILE_SIZE - 1 - y)
+            % 4
+            == 0 =>
+        {
+            [95, 57, 30]
+        }
+        5 => [157, 105, 55],
+        // Leaves: dense green clusters, kept opaque for stable depth writes.
+        6 if noise % 7 == 0 => [45, 96, 45],
+        6 => [53, 126, 54],
+        // Sand.
+        7 if noise % 13 == 0 => [202, 175, 105],
+        7 => [222, 194, 121],
+        // Water: a blue tile with a subtle horizontal current.
+        8 if (x + y * 2) % 9 < 2 => [71, 156, 203],
+        8 => [48, 121, 183],
+        _ => [255, 0, 255],
+    };
+    for component in &mut color {
+        *component = ((i16::from(*component) + shade).clamp(0, 255)) as u8;
+    }
+    [color[0], color[1], color[2], 255]
+}
+
+fn pixel_noise(tile: u32, x: u32, y: u32) -> u32 {
+    let mut value = tile.wrapping_mul(0x9E37_79B9) ^ x.wrapping_mul(0x85EB_CA6B);
+    value ^= y.wrapping_mul(0xC2B2_AE35);
+    value ^= value >> 16;
+    value.wrapping_mul(0x7FEB_352D) ^ (value >> 15)
+}
+
+/// Map a core atlas coordinate into this atlas, preserving its local UV.
+///
+/// The core owns the material choice and emits a normalized coordinate in the
+/// same four-column atlas layout. Decoding through the material keeps a tiny
+/// half-texel inset around every tile, preventing sampling from an adjacent
+/// block texture at a shared edge.
+fn atlas_tex_coord(block: Block, normal: Vec3, atlas_uv: [f32; 2]) -> [f32; 2] {
+    let tile = block_texture_tile(block, normal);
+    let tile_x = tile % ATLAS_COLUMNS;
+    let tile_y = tile / ATLAS_COLUMNS;
+    let inset = 0.5 / ATLAS_TILE_SIZE as f32;
+    let local_u = (atlas_uv[0] * ATLAS_COLUMNS as f32 - tile_x as f32).clamp(0.0, 1.0);
+    let local_v = (atlas_uv[1] * ATLAS_ROWS as f32 - tile_y as f32).clamp(0.0, 1.0);
     [
-        color[0] * shade,
-        color[1] * shade,
-        color[2] * shade,
-        color[3],
+        (tile_x as f32 + local_u.mul_add(1.0 - inset * 2.0, inset)) / ATLAS_COLUMNS as f32,
+        (tile_y as f32 + local_v.mul_add(1.0 - inset * 2.0, inset)) / ATLAS_ROWS as f32,
+    ]
+}
+
+fn block_texture_tile(block: Block, normal: Vec3) -> u32 {
+    match block {
+        Block::Grass if normal.y > 0.5 => 0,
+        Block::Grass if normal.y < -0.5 => 2,
+        Block::Grass => 1,
+        Block::Dirt => 2,
+        Block::Stone => 3,
+        Block::Wood if normal.y.abs() > 0.5 => 5,
+        Block::Wood => 4,
+        Block::Leaves => 6,
+        Block::Sand => 7,
+        Block::Water => 8,
+        Block::Air => 0,
+    }
+}
+
+/// Combine a moving directional sun with the terrain's baked occlusion light.
+fn sunlight_color(
+    normal: Vec3,
+    sky_light: f32,
+    ambient_occlusion: f32,
+    sun_phase: f32,
+) -> [f32; 4] {
+    let sun_angle = sun_phase * core::f32::consts::TAU;
+    let sun = Vec3::new(
+        sun_angle.cos() * 0.62,
+        sun_angle.sin(),
+        sun_angle.sin() * 0.42,
+    )
+    .normalized();
+    let daylight = (sun.y * 0.5 + 0.5).clamp(0.08, 1.0);
+    let direct = normal.dot(sun).max(0.0) * daylight;
+    let ambient = 0.08 + daylight * 0.12 + sky_light.clamp(0.0, 1.0) * (0.10 + daylight * 0.22);
+    let occlusion = 0.52 + ambient_occlusion.clamp(0.0, 1.0) * 0.48;
+    let brightness = ((ambient + direct * 0.68) * occlusion).clamp(0.0, 1.0);
+    [
+        brightness,
+        brightness * (0.93 + daylight * 0.07),
+        brightness * (0.79 + daylight * 0.21),
+        1.0,
     ]
 }
 
@@ -577,5 +749,6 @@ fn block_name(block: Block) -> &'static str {
         Block::Wood => "Wood",
         Block::Leaves => "Leaves",
         Block::Sand => "Sand",
+        Block::Water => "Water",
     }
 }

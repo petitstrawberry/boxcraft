@@ -24,6 +24,8 @@ const ATLAS_COLUMNS: u32 = 4;
 const ATLAS_ROWS: u32 = 3;
 const DAY_LENGTH_SECONDS: f32 = 150.0;
 const SUNLIGHT_UPDATES_PER_SECOND: f32 = 8.0;
+/// Number of retained textured terrain draws, from deepest shadow to sunlight.
+const TERRAIN_LIGHT_BUCKETS: usize = 4;
 
 /// Run the Boxcraft application.
 ///
@@ -90,7 +92,7 @@ struct BoxcraftApp {
     fullscreen_pending: State<bool>,
     canvas_frame: State<Arc<SgfxCanvasFrame>>,
     terrain_mesh: State<Arc<Mesh>>,
-    mesh: State<Option<Arc<SgfxMesh>>>,
+    terrain_meshes: State<Arc<[Option<Arc<SgfxMesh>>; TERRAIN_LIGHT_BUCKETS]>>,
     mesh_revision: State<u64>,
     frame_revision: State<u64>,
     sun_phase: State<f32>,
@@ -100,7 +102,7 @@ struct BoxcraftApp {
     selected_block: State<String>,
     status: State<String>,
     canvas_handle: SgfxCanvasHandle,
-    mesh_handle: SgfxMeshHandle,
+    mesh_handles: [SgfxMeshHandle; TERRAIN_LIGHT_BUCKETS],
     block_atlas: Arc<SgfxTexture>,
     runtime: Arc<Mutex<Runtime>>,
 }
@@ -127,7 +129,7 @@ impl BoxcraftApp {
             fullscreen_pending: State::new(StateId::new(9), false),
             canvas_frame: State::new(StateId::new(10), initial_frame),
             terrain_mesh: State::new(StateId::new(19), Arc::new(Mesh::default())),
-            mesh: State::new(StateId::new(11), None),
+            terrain_meshes: State::new(StateId::new(11), Arc::new(std::array::from_fn(|_| None))),
             mesh_revision: State::new(StateId::new(12), 0),
             frame_revision: State::new(StateId::new(13), 0),
             sun_phase: State::new(StateId::new(20), 0.0),
@@ -140,7 +142,7 @@ impl BoxcraftApp {
                 String::from("Click the terrain to capture the pointer"),
             ),
             canvas_handle: SgfxCanvasHandle::new(),
-            mesh_handle: SgfxMeshHandle::new(),
+            mesh_handles: std::array::from_fn(|_| SgfxMeshHandle::new()),
             block_atlas: block_texture_atlas(),
             runtime: Arc::new(Mutex::new(Runtime::new())),
         };
@@ -311,39 +313,55 @@ impl BoxcraftApp {
     /// Rebuild the retained SGFX mesh from the latest terrain snapshot.
     ///
     /// Terrain supplies local UVs, material identity, and ambient-occlusion
-    /// light. The frontend maps those values into the pixel atlas and applies
-    /// the current moving sun before handing the triangle list to SGFX.
+    /// light. The frontend maps those values into the pixel atlas, then groups
+    /// complete triangles by their moving-sun illumination. Textured SGFX draws
+    /// use each group's uniform tint because that pipeline does not consume
+    /// per-vertex colors.
     fn rebuild_render_mesh(&self) {
         let core_mesh = self.terrain_mesh.get();
         let sun_phase = self.sun_phase.get();
-        let mut vertices = Vec::with_capacity(core_mesh.indices.len());
-        for &index in &core_mesh.indices {
-            let Some(vertex) = core_mesh.vertices.get(index as usize) else {
+        let mut bucket_vertices: [Vec<SgfxCanvasVertex>; TERRAIN_LIGHT_BUCKETS] =
+            std::array::from_fn(|_| Vec::new());
+
+        for triangle in core_mesh.indices.chunks_exact(3) {
+            let [first, second, third] = triangle else {
                 continue;
             };
-            vertices.push(
-                SgfxCanvasVertex::new(
-                    [vertex.position.x, vertex.position.y, vertex.position.z, 1.0],
-                    sunlight_color(
+            let (Some(first), Some(second), Some(third)) = (
+                core_mesh.vertices.get(*first as usize),
+                core_mesh.vertices.get(*second as usize),
+                core_mesh.vertices.get(*third as usize),
+            ) else {
+                continue;
+            };
+            let bucket = terrain_triangle_light_bucket([first, second, third], sun_phase);
+            let vertices = &mut bucket_vertices[bucket];
+            for vertex in [first, second, third] {
+                vertices.push(
+                    // Textured SGFX currently ignores vertex color. Keep this
+                    // neutral so the bucket draw tint remains the single
+                    // source of textured terrain illumination.
+                    SgfxCanvasVertex::new(
+                        [vertex.position.x, vertex.position.y, vertex.position.z, 1.0],
+                        [1.0, 1.0, 1.0, 1.0],
+                    )
+                    .with_tex_coord(atlas_tex_coord(
+                        vertex.block,
                         vertex.normal,
-                        vertex.light,
-                        vertex.ambient_occlusion,
-                        sun_phase,
-                    ),
-                )
-                .with_tex_coord(atlas_tex_coord(
-                    vertex.block,
-                    vertex.normal,
-                    vertex.atlas_uv,
-                )),
-            );
+                        vertex.atlas_uv,
+                    )),
+                );
+            }
         }
         self.mesh_revision
             .update(|revision| *revision = revision.wrapping_add(1));
         let revision = self.mesh_revision.get();
-        let mesh = (!vertices.is_empty())
-            .then(|| SgfxMesh::with_handle(self.mesh_handle, revision, vertices));
-        self.mesh.set(mesh);
+        let meshes = std::array::from_fn(|bucket| {
+            let vertices = core::mem::take(&mut bucket_vertices[bucket]);
+            (!vertices.is_empty())
+                .then(|| SgfxMesh::with_handle(self.mesh_handles[bucket], revision, vertices))
+        });
+        self.terrain_meshes.set(Arc::new(meshes));
     }
 
     fn refresh_frame(&self) {
@@ -360,9 +378,16 @@ impl BoxcraftApp {
                 .depth_tested()
                 // The SGFX renderer corrects this reference perspective as its canvas resizes.
                 .reference_aspect(REFERENCE_ASPECT);
-        if let Some(mesh) = self.mesh.get() {
-            frame = frame
-                .draw(SgfxCanvasDraw::new(mesh, transform).texture(Arc::clone(&self.block_atlas)));
+        let terrain_meshes = self.terrain_meshes.get();
+        let sun_phase = self.sun_phase.get();
+        for (bucket, mesh) in terrain_meshes.iter().enumerate() {
+            if let Some(mesh) = mesh {
+                frame = frame.draw(
+                    SgfxCanvasDraw::new(Arc::clone(mesh), transform)
+                        .tint(terrain_bucket_tint(bucket, sun_phase))
+                        .texture(Arc::clone(&self.block_atlas)),
+                );
+            }
         }
         self.canvas_frame.set(Arc::new(frame));
     }
@@ -683,7 +708,8 @@ fn pixel_noise(tile: u32, x: u32, y: u32) -> u32 {
 /// The core owns the material choice and emits a normalized coordinate in the
 /// same four-column atlas layout. Decoding through the material keeps a tiny
 /// half-texel inset around every tile, preventing sampling from an adjacent
-/// block texture at a shared edge.
+/// block texture at a shared edge. Atlas pixels are authored top-to-bottom,
+/// while SGFX samples texture V bottom-to-top, so the final V is flipped.
 fn atlas_tex_coord(block: Block, normal: Vec3, atlas_uv: [f32; 2]) -> [f32; 2] {
     let tile = block_texture_tile(block, normal);
     let tile_x = tile % ATLAS_COLUMNS;
@@ -691,10 +717,10 @@ fn atlas_tex_coord(block: Block, normal: Vec3, atlas_uv: [f32; 2]) -> [f32; 2] {
     let inset = 0.5 / ATLAS_TILE_SIZE as f32;
     let local_u = (atlas_uv[0] * ATLAS_COLUMNS as f32 - tile_x as f32).clamp(0.0, 1.0);
     let local_v = (atlas_uv[1] * ATLAS_ROWS as f32 - tile_y as f32).clamp(0.0, 1.0);
-    [
-        (tile_x as f32 + local_u.mul_add(1.0 - inset * 2.0, inset)) / ATLAS_COLUMNS as f32,
-        (tile_y as f32 + local_v.mul_add(1.0 - inset * 2.0, inset)) / ATLAS_ROWS as f32,
-    ]
+    let mapped_u =
+        (tile_x as f32 + local_u.mul_add(1.0 - inset * 2.0, inset)) / ATLAS_COLUMNS as f32;
+    let mapped_v = (tile_y as f32 + local_v.mul_add(1.0 - inset * 2.0, inset)) / ATLAS_ROWS as f32;
+    [mapped_u, 1.0 - mapped_v]
 }
 
 fn block_texture_tile(block: Block, normal: Vec3) -> u32 {
@@ -713,31 +739,78 @@ fn block_texture_tile(block: Block, normal: Vec3) -> u32 {
     }
 }
 
+/// Place a complete triangle in a stable coarse illumination bucket.
+///
+/// Textured SGFX draws apply one tint uniform per draw, rather than a color
+/// per vertex. Averaging the three source corners makes each triangle's shadow
+/// band stable while retaining both baked AO and moving sun direction.
+fn terrain_triangle_light_bucket(vertices: [&boxcraft_core::Vertex; 3], sun_phase: f32) -> usize {
+    let brightness = vertices
+        .into_iter()
+        .map(|vertex| {
+            sunlight_brightness(
+                vertex.normal,
+                vertex.light,
+                vertex.ambient_occlusion,
+                sun_phase,
+            )
+        })
+        .sum::<f32>()
+        / 3.0;
+    terrain_light_bucket(brightness)
+}
+
+/// Convert normalized illumination to a bounded terrain-draw bucket.
+fn terrain_light_bucket(brightness: f32) -> usize {
+    ((brightness.clamp(0.0, 1.0) * TERRAIN_LIGHT_BUCKETS as f32) as usize)
+        .min(TERRAIN_LIGHT_BUCKETS - 1)
+}
+
+/// Build the uniform tint used for one illuminated terrain bucket.
+///
+/// The color temperature follows the moving sun as well as the bucket's
+/// brightness. This is deliberately a draw tint so it affects textured pixels
+/// even though SGFX's textured pipeline ignores `SgfxCanvasVertex::color`.
+fn terrain_bucket_tint(bucket: usize, sun_phase: f32) -> Color {
+    let brightness =
+        ((bucket.min(TERRAIN_LIGHT_BUCKETS - 1) as f32) + 0.5) / TERRAIN_LIGHT_BUCKETS as f32;
+    let daylight = sunlight_daylight(sun_phase);
+    Color::rgb(
+        brightness,
+        brightness * (0.86 + daylight * 0.14),
+        brightness * (0.69 + daylight * 0.31),
+    )
+}
+
 /// Combine a moving directional sun with the terrain's baked occlusion light.
-fn sunlight_color(
+fn sunlight_brightness(
     normal: Vec3,
     sky_light: f32,
     ambient_occlusion: f32,
     sun_phase: f32,
-) -> [f32; 4] {
+) -> f32 {
+    let sun = sunlight_direction(sun_phase);
+    let daylight = sunlight_daylight(sun_phase);
+    let direct = normal.dot(sun).max(0.0) * daylight;
+    let ambient = 0.08 + daylight * 0.12 + sky_light.clamp(0.0, 1.0) * (0.10 + daylight * 0.22);
+    let occlusion = 0.52 + ambient_occlusion.clamp(0.0, 1.0) * 0.48;
+    ((ambient + direct * 0.68) * occlusion).clamp(0.0, 1.0)
+}
+
+/// Return the normalized directional sun vector for a day-cycle phase.
+fn sunlight_direction(sun_phase: f32) -> Vec3 {
     let sun_angle = sun_phase * core::f32::consts::TAU;
-    let sun = Vec3::new(
+    Vec3::new(
         sun_angle.cos() * 0.62,
         sun_angle.sin(),
         sun_angle.sin() * 0.42,
     )
-    .normalized();
-    let daylight = (sun.y * 0.5 + 0.5).clamp(0.08, 1.0);
-    let direct = normal.dot(sun).max(0.0) * daylight;
-    let ambient = 0.08 + daylight * 0.12 + sky_light.clamp(0.0, 1.0) * (0.10 + daylight * 0.22);
-    let occlusion = 0.52 + ambient_occlusion.clamp(0.0, 1.0) * 0.48;
-    let brightness = ((ambient + direct * 0.68) * occlusion).clamp(0.0, 1.0);
-    [
-        brightness,
-        brightness * (0.93 + daylight * 0.07),
-        brightness * (0.79 + daylight * 0.21),
-        1.0,
-    ]
+    .normalized()
+}
+
+/// Return the sun's horizon-aware daylight contribution for a phase.
+fn sunlight_daylight(sun_phase: f32) -> f32 {
+    (sunlight_direction(sun_phase).y * 0.5 + 0.5).clamp(0.08, 1.0)
 }
 
 fn block_name(block: Block) -> &'static str {
@@ -750,5 +823,28 @@ fn block_name(block: Block) -> &'static str {
         Block::Leaves => "Leaves",
         Block::Sand => "Sand",
         Block::Water => "Water",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn atlas_v_is_flipped_for_bottom_origin_sgfx_sampling() {
+        let top = atlas_tex_coord(Block::Grass, Vec3::new(0.0, 1.0, 0.0), [0.0, 0.0]);
+        let bottom = atlas_tex_coord(Block::Grass, Vec3::new(0.0, 1.0, 0.0), [0.0, 1.0]);
+
+        assert!(top[1] > bottom[1]);
+        assert!(top[1] > 0.98);
+    }
+
+    #[test]
+    fn terrain_light_bucket_is_bounded_and_ordered() {
+        assert_eq!(terrain_light_bucket(-1.0), 0);
+        assert_eq!(terrain_light_bucket(0.0), 0);
+        assert!(terrain_light_bucket(0.25) > terrain_light_bucket(0.0));
+        assert_eq!(terrain_light_bucket(1.0), TERRAIN_LIGHT_BUCKETS - 1);
+        assert_eq!(terrain_light_bucket(2.0), TERRAIN_LIGHT_BUCKETS - 1);
     }
 }

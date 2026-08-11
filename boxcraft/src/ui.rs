@@ -312,7 +312,6 @@ impl BoxcraftApp {
             let camera = game.player.camera();
             Mat4::perspective_rh_gl(CAMERA_FOV, REFERENCE_ASPECT, 0.05, 128.0)
                 .mul_mat4(camera.view_matrix())
-                .with_inverted_clip_y()
                 .columns
         });
         self.frame_revision

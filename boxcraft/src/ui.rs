@@ -709,7 +709,9 @@ fn pixel_noise(tile: u32, x: u32, y: u32) -> u32 {
 /// same four-column atlas layout. Decoding through the material keeps a tiny
 /// half-texel inset around every tile, preventing sampling from an adjacent
 /// block texture at a shared edge. Atlas pixels are authored top-to-bottom,
-/// while SGFX samples texture V bottom-to-top, so the final V is flipped.
+/// while SGFX samples each tile's V coordinate in the opposite direction, so
+/// only the local V is flipped. Keeping the tile row fixed is important: a
+/// whole-atlas flip would turn the grass row into the water row.
 fn atlas_tex_coord(block: Block, normal: Vec3, atlas_uv: [f32; 2]) -> [f32; 2] {
     let tile = block_texture_tile(block, normal);
     let tile_x = tile % ATLAS_COLUMNS;
@@ -719,8 +721,10 @@ fn atlas_tex_coord(block: Block, normal: Vec3, atlas_uv: [f32; 2]) -> [f32; 2] {
     let local_v = (atlas_uv[1] * ATLAS_ROWS as f32 - tile_y as f32).clamp(0.0, 1.0);
     let mapped_u =
         (tile_x as f32 + local_u.mul_add(1.0 - inset * 2.0, inset)) / ATLAS_COLUMNS as f32;
-    let mapped_v = (tile_y as f32 + local_v.mul_add(1.0 - inset * 2.0, inset)) / ATLAS_ROWS as f32;
-    [mapped_u, 1.0 - mapped_v]
+    let flipped_local_v = 1.0 - local_v;
+    let mapped_v =
+        (tile_y as f32 + flipped_local_v.mul_add(1.0 - inset * 2.0, inset)) / ATLAS_ROWS as f32;
+    [mapped_u, mapped_v]
 }
 
 fn block_texture_tile(block: Block, normal: Vec3) -> u32 {
@@ -831,12 +835,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn atlas_v_is_flipped_for_bottom_origin_sgfx_sampling() {
+    fn atlas_v_is_flipped_without_swapping_atlas_rows() {
         let top = atlas_tex_coord(Block::Grass, Vec3::new(0.0, 1.0, 0.0), [0.0, 0.0]);
         let bottom = atlas_tex_coord(Block::Grass, Vec3::new(0.0, 1.0, 0.0), [0.0, 1.0]);
+        let water = atlas_tex_coord(Block::Water, Vec3::new(0.0, 1.0, 0.0), [0.0, 2.0]);
 
         assert!(top[1] > bottom[1]);
-        assert!(top[1] > 0.98);
+        assert!(top[1] < 1.0 / ATLAS_ROWS);
+        assert!(water[1] > 2.0 / ATLAS_ROWS);
     }
 
     #[test]

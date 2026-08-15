@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use boxcraft_core::{
-    Block, CHUNK_SIZE, Game, IVec3, Mat4, PlayerInput, Vec3, VisibleSpace, mesh_chunk,
+    Block, CHUNK_SIZE, Game, IVec3, LightUpdate, Mat4, PlayerInput, Vec3, VisibleSpace, mesh_chunk,
     mesh_chunk_lod,
 };
 use scarlet_ui::prelude::*;
@@ -426,81 +426,111 @@ impl BoxcraftApp {
             return true;
         }
 
-        let mut edited = None;
-        let changed = self.with_game(|game| match button {
+        let edit = self.with_game(|game| match button {
             MouseButton::Left => {
-                edited = game
-                    .world
-                    .raycast(
-                        game.player.camera().position,
-                        game.player.camera().forward(),
-                        REACH,
-                    )
-                    .map(|hit| hit.position);
-                game.player.break_block(&mut game.world, REACH).is_some()
+                let hit = game.world.raycast(
+                    game.player.camera().position,
+                    game.player.camera().forward(),
+                    REACH,
+                )?;
+                let topology_changed = game.world.block(hit.position).is_some_and(Block::occludes);
+                game.player
+                    .break_block_with_light_update(&mut game.world, REACH)
+                    .map(|(hit, light)| (hit.position, light, topology_changed))
             }
             MouseButton::Right => {
-                edited = game
-                    .player
-                    .place_block(&mut game.world, REACH)
-                    .map(|position| position);
-                edited.is_some()
+                let topology_changed = game.player.selected_block.occludes();
+                game.player
+                    .place_block_with_light_update(&mut game.world, REACH)
+                    .map(|(position, light)| (position, light, topology_changed))
             }
-            MouseButton::Middle => false,
+            MouseButton::Middle => None,
         });
-        if changed {
-            if let Some(position) = edited {
-                self.rebuild_edited_chunks(position);
-            }
+        if let Some((position, light_update, topology_changed)) = edit {
+            self.rebuild_edited_chunks(position, light_update, topology_changed);
         }
         true
     }
 
-    /// Rebuild the chunks touched by a block edit, plus neighbours when the
-    /// edit sits on a chunk border and affects their ambient occlusion.
-    fn rebuild_edited_chunks(&self, position: boxcraft_core::IVec3) {
-        let chunk = (
-            (position.x as i32).div_euclid(CHUNK_SIZE),
-            (position.z as i32).div_euclid(CHUNK_SIZE),
+    /// Rebuild every resident chunk touched by changed geometry or light.
+    fn rebuild_edited_chunks(
+        &self,
+        position: IVec3,
+        light_update: LightUpdate,
+        topology_changed: bool,
+    ) {
+        let mut affected = HashSet::new();
+        insert_chunks_for_voxel_bounds(
+            &mut affected,
+            position.x - 1,
+            position.x + 1,
+            position.z - 1,
+            position.z + 1,
         );
-        let local_x = position.x.rem_euclid(CHUNK_SIZE);
-        let local_z = position.z.rem_euclid(CHUNK_SIZE);
+        if let Some((min_x, max_x, min_z, max_z)) = light_update.horizontal_bounds() {
+            // Smooth vertex light samples cells on both sides of a chunk edge.
+            insert_chunks_for_voxel_bounds(
+                &mut affected,
+                min_x - 1,
+                max_x + 1,
+                min_z - 1,
+                max_z + 1,
+            );
+        }
+
+        let resident_near = self.near_meshes.get();
         let mut rebuilt = false;
-        // Ambient occlusion and smooth light reach one block across the
-        // border, so only rebuild a neighbour when the edit is edge-adjacent.
-        let mut offsets = vec![(0, 0)];
-        if local_x == 0 {
-            offsets.extend([(-1, 0), (-1, -1), (-1, 1)]);
+        for chunk in affected
+            .iter()
+            .copied()
+            .filter(|chunk| resident_near.contains_key(chunk))
+        {
+            rebuilt |= self.build_near_chunk(chunk.0, chunk.1);
         }
-        if local_x == CHUNK_SIZE - 1 {
-            offsets.extend([(1, 0), (1, -1), (1, 1)]);
-        }
-        if local_z == 0 {
-            offsets.extend([(0, -1)]);
-        }
-        if local_z == CHUNK_SIZE - 1 {
-            offsets.extend([(0, 1)]);
-        }
-        for offset in offsets {
-            rebuilt |= self.build_near_chunk(chunk.0 + offset.0, chunk.1 + offset.1);
-        }
-        if rebuilt {
-            // An edit can change visibility, AO, and propagated light across
-            // the far-ring boundary. Invalidate the cached far geometry so it
-            // is rebuilt from the new world state once the near queue settles.
+
+        let far_chunks: HashSet<(i32, i32)> = self
+            .runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .far_chunks
+            .iter()
+            .copied()
+            .collect();
+        let affected_far: Vec<(i32, i32)> = affected
+            .iter()
+            .copied()
+            .filter(|chunk| far_chunks.contains(chunk))
+            .collect();
+        let far_dirty = if topology_changed {
+            // Opening or sealing space can change which connected cave
+            // component is visible, so topology edits invalidate the LOD map.
             self.far_core_meshes.set(Arc::new(
                 HashMap::<(i32, i32), Arc<boxcraft_core::Mesh>>::new(),
             ));
-            self.far_meshes
-                .set(Arc::new(HashMap::<(i32, i32), Arc<SgfxMesh>>::new()));
             *self
                 .visible_space
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            !far_chunks.is_empty()
+        } else if affected_far.is_empty() {
+            false
+        } else {
+            self.far_core_meshes.update(|meshes| {
+                let mut next = (**meshes).clone();
+                for chunk in &affected_far {
+                    next.remove(chunk);
+                }
+                *meshes = Arc::new(next);
+            });
+            true
+        };
+        if far_dirty {
             self.runtime
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .far_dirty = true;
+        }
+        if rebuilt {
             self.refresh_frame();
         }
     }
@@ -1469,6 +1499,24 @@ fn block_name(block: Block) -> &'static str {
         Block::Water => "Water",
         Block::Snow => "Snow",
         Block::Torch => "Torch",
+    }
+}
+
+fn insert_chunks_for_voxel_bounds(
+    chunks: &mut HashSet<(i32, i32)>,
+    min_x: i32,
+    max_x: i32,
+    min_z: i32,
+    max_z: i32,
+) {
+    let min_chunk_x = min_x.div_euclid(CHUNK_SIZE);
+    let max_chunk_x = max_x.div_euclid(CHUNK_SIZE);
+    let min_chunk_z = min_z.div_euclid(CHUNK_SIZE);
+    let max_chunk_z = max_z.div_euclid(CHUNK_SIZE);
+    for chunk_z in min_chunk_z..=max_chunk_z {
+        for chunk_x in min_chunk_x..=max_chunk_x {
+            chunks.insert((chunk_x, chunk_z));
+        }
     }
 }
 

@@ -440,8 +440,47 @@ pub struct World {
     height: usize,
     depth: usize,
     blocks: Vec<Block>,
+    direct_sunlight: Vec<u8>,
     sunlight: Vec<u8>,
     block_light: Vec<u8>,
+    light_queue_pending: Vec<u8>,
+    lighting_initialized: bool,
+}
+
+/// Horizontal extent whose baked mesh lighting changed after a block edit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LightUpdate {
+    min_x: i32,
+    max_x: i32,
+    min_z: i32,
+    max_z: i32,
+}
+
+impl LightUpdate {
+    const fn empty() -> Self {
+        Self {
+            min_x: i32::MAX,
+            max_x: i32::MIN,
+            min_z: i32::MAX,
+            max_z: i32::MIN,
+        }
+    }
+
+    /// Return the inclusive horizontal bounds of changed light cells.
+    pub const fn horizontal_bounds(self) -> Option<(i32, i32, i32, i32)> {
+        if self.min_x > self.max_x || self.min_z > self.max_z {
+            None
+        } else {
+            Some((self.min_x, self.max_x, self.min_z, self.max_z))
+        }
+    }
+
+    fn include(&mut self, position: IVec3) {
+        self.min_x = self.min_x.min(position.x);
+        self.max_x = self.max_x.max(position.x);
+        self.min_z = self.min_z.min(position.z);
+        self.max_z = self.max_z.max(position.z);
+    }
 }
 
 /// Non-occluding voxel space reachable from the world exterior or a viewer.
@@ -579,13 +618,17 @@ impl World {
     ///
     /// An all-air world with densely allocated storage.
     pub fn new(width: usize, height: usize, depth: usize) -> Self {
+        let cells = width.saturating_mul(height).saturating_mul(depth);
         Self {
             width,
             height,
             depth,
-            blocks: vec![Block::Air; width.saturating_mul(height).saturating_mul(depth)],
-            sunlight: vec![0; width.saturating_mul(height).saturating_mul(depth)],
-            block_light: vec![0; width.saturating_mul(height).saturating_mul(depth)],
+            blocks: vec![Block::Air; cells],
+            direct_sunlight: vec![0; cells],
+            sunlight: vec![0; cells],
+            block_light: vec![0; cells],
+            light_queue_pending: vec![0; cells],
+            lighting_initialized: false,
         }
     }
 
@@ -716,9 +759,11 @@ impl World {
     pub fn recompute_light(&mut self) {
         self.recompute_sky_light();
         self.recompute_block_light_global();
+        self.lighting_initialized = true;
     }
 
     fn recompute_sky_light(&mut self) {
+        self.direct_sunlight.iter_mut().for_each(|light| *light = 0);
         self.sunlight.iter_mut().for_each(|light| *light = 0);
         let mut queue = std::collections::VecDeque::new();
         for z in 0..self.depth as i32 {
@@ -734,6 +779,7 @@ impl World {
                         break;
                     }
                     if let Some(index) = self.index(position) {
+                        self.direct_sunlight[index] = level;
                         self.sunlight[index] = level;
                         queue.push_back(index);
                     }
@@ -853,188 +899,94 @@ impl World {
         }
     }
 
-    /// Recomputes sky light only within a local region around an edit.
-    ///
-    /// Sky light travels at most 15 cells from its source, so an edit cannot
-    /// change cells farther than that. The region shell therefore still holds
-    /// valid pre-edit light and seeds the flood fill back into the region.
+    /// Incrementally refresh both light channels after one block edit.
     ///
     /// # Arguments
     ///
     /// * `center` - Edited voxel around which light is refreshed.
-    /// * `radius` - Horizontal refresh radius; values below 17 are raised.
-    pub fn recompute_light_around(&mut self, center: IVec3, radius: i32) {
-        let radius = radius.max(17);
-        let min_x = (center.x - radius).max(0);
-        let max_x = (center.x + radius).min(self.width as i32 - 1);
-        let min_z = (center.z - radius).max(0);
-        let max_z = (center.z + radius).min(self.depth as i32 - 1);
-        if min_x > max_x || min_z > max_z {
-            return;
-        }
+    /// * `radius` - Retained for API compatibility; propagation now continues
+    ///   until no light value changes and is not clipped to a fixed radius.
+    ///
+    /// # Returns
+    ///
+    /// Horizontal bounds of cells whose final sky or block light changed.
+    pub fn recompute_light_around(&mut self, center: IVec3, _radius: i32) -> LightUpdate {
+        self.recompute_light_after_edit(center)
+    }
 
-        // Clear both light channels inside the region.
-        for y in 0..self.height as i32 {
-            for z in min_z..=max_z {
-                for x in min_x..=max_x {
-                    if let Some(index) = self.index(IVec3::new(x, y, z)) {
-                        self.sunlight[index] = 0;
-                        self.block_light[index] = 0;
-                    }
-                }
-            }
-        }
-
-        // Reseed direct sky columns inside the region.
-        let mut sky_queue = std::collections::VecDeque::new();
-        for z in min_z..=max_z {
-            for x in min_x..=max_x {
-                let mut level = 15_u8;
-                for y in (0..self.height as i32).rev() {
-                    let position = IVec3::new(x, y, z);
-                    let opacity = self.block(position).unwrap_or(Block::Air).light_opacity();
-                    if opacity > 0 || level < 15 {
-                        level = level.saturating_sub(opacity.max(1));
-                    }
-                    if level == 0 {
-                        break;
-                    }
-                    if let Some(index) = self.index(position) {
-                        self.sunlight[index] = level;
-                        sky_queue.push_back(index);
-                    }
-                }
-            }
-        }
-
-        // Reseed block-light emitters inside the region.
-        let mut block_queue = std::collections::VecDeque::new();
-        for y in 0..self.height as i32 {
-            for z in min_z..=max_z {
-                for x in min_x..=max_x {
-                    let position = IVec3::new(x, y, z);
-                    let Some(index) = self.index(position) else {
-                        continue;
-                    };
-                    let emission = self.blocks[index].light_emission();
-                    if emission > 0 {
-                        self.block_light[index] = emission;
-                        block_queue.push_back(index);
-                    }
-                }
-            }
-        }
-
-        // The one-cell ring outside the region still holds valid pre-edit
-        // light for both channels; seed it inwards.
-        let mut shell_cells = Vec::new();
-        for y in 0..self.height as i32 {
-            if min_x - 1 >= 0 {
-                for z in min_z..=max_z {
-                    shell_cells.push(IVec3::new(min_x - 1, y, z));
-                }
-            }
-            if max_x + 1 < self.width as i32 {
-                for z in min_z..=max_z {
-                    shell_cells.push(IVec3::new(max_x + 1, y, z));
-                }
-            }
-            if min_z - 1 >= 0 {
-                for x in min_x..=max_x {
-                    shell_cells.push(IVec3::new(x, y, min_z - 1));
-                }
-            }
-            if max_z + 1 < self.depth as i32 {
-                for x in min_x..=max_x {
-                    shell_cells.push(IVec3::new(x, y, max_z + 1));
-                }
-            }
-        }
-        let in_region = |position: IVec3| {
-            position.x >= min_x && position.x <= max_x && position.z >= min_z && position.z <= max_z
+    /// Incrementally refresh both light channels after one block edit.
+    pub fn recompute_light_after_edit(&mut self, center: IVec3) -> LightUpdate {
+        let Some(center_index) = self.index(center) else {
+            return LightUpdate::empty();
         };
-        for shell in shell_cells {
-            for offset in [
-                IVec3::new(-1, 0, 0),
-                IVec3::new(1, 0, 0),
-                IVec3::new(0, -1, 0),
-                IVec3::new(0, 1, 0),
-                IVec3::new(0, 0, -1),
-                IVec3::new(0, 0, 1),
-            ] {
-                let neighbor = shell + offset;
-                if !in_region(neighbor) {
-                    continue;
-                }
-                let Some(neighbor_index) = self.index(neighbor) else {
-                    continue;
-                };
-                let opacity = self.blocks[neighbor_index].light_opacity().max(1);
-                let sky_spread = self.sunlight(shell).saturating_sub(opacity);
-                if sky_spread > self.sunlight[neighbor_index] {
-                    self.sunlight[neighbor_index] = sky_spread;
-                    sky_queue.push_back(neighbor_index);
-                }
-                let block_spread = self.block_light(shell).saturating_sub(opacity);
-                if block_spread > self.block_light[neighbor_index] {
-                    self.block_light[neighbor_index] = block_spread;
-                    block_queue.push_back(neighbor_index);
-                }
+        if !self.lighting_initialized {
+            self.recompute_light();
+            let mut changed = LightUpdate::empty();
+            if self.width > 0 && self.depth > 0 {
+                changed.include(IVec3::new(0, 0, 0));
+                changed.include(IVec3::new(self.width as i32 - 1, 0, self.depth as i32 - 1));
             }
+            return changed;
         }
+        debug_assert!(self.light_queue_pending.iter().all(|pending| *pending == 0));
 
-        // Flood both refreshed channels throughout the region only.
-        self.propagate_sky_light(&mut sky_queue, in_region);
-        self.propagate_block_light_bounded(&mut block_queue, in_region);
+        let mut changed = LightUpdate::empty();
+        let mut queue = std::collections::VecDeque::new();
+        self.refresh_direct_sunlight_after_edit(center, &mut queue);
+        Self::enqueue_light(&mut queue, &mut self.light_queue_pending, center_index);
+        self.relax_sunlight(&mut queue, &mut changed);
+
+        Self::enqueue_light(&mut queue, &mut self.light_queue_pending, center_index);
+        self.relax_block_light(&mut queue, &mut changed);
+        debug_assert!(self.light_queue_pending.iter().all(|pending| *pending == 0));
+        changed
     }
 
-    fn propagate_sky_light(
+    fn refresh_direct_sunlight_after_edit(
         &mut self,
+        center: IVec3,
         queue: &mut std::collections::VecDeque<usize>,
-        in_region: impl Fn(IVec3) -> bool,
     ) {
-        while let Some(index) = queue.pop_front() {
-            let level = self.sunlight[index];
-            if level <= 1 {
-                continue;
-            }
-            let position = self.position_of(index);
-            for offset in [
-                IVec3::new(-1, 0, 0),
-                IVec3::new(1, 0, 0),
-                IVec3::new(0, -1, 0),
-                IVec3::new(0, 1, 0),
-                IVec3::new(0, 0, -1),
-                IVec3::new(0, 0, 1),
-            ] {
-                let neighbor = position + offset;
-                if !in_region(neighbor) {
-                    continue;
-                }
-                let Some(neighbor_index) = self.index(neighbor) else {
-                    continue;
-                };
-                let opacity = self.blocks[neighbor_index].light_opacity().max(1);
-                let spread = level.saturating_sub(opacity);
-                if spread > self.sunlight[neighbor_index] {
-                    self.sunlight[neighbor_index] = spread;
-                    queue.push_back(neighbor_index);
+        // Direct sky only travels down a column. Everything above the edit is
+        // unchanged, so resume from the cached value immediately above it and
+        // stop as soon as the recurrence rejoins the old cached column.
+        let mut level = self
+            .index(center + IVec3::new(0, 1, 0))
+            .map(|index| self.direct_sunlight[index])
+            .unwrap_or(15);
+        for y in (0..=center.y).rev() {
+            let position = IVec3::new(center.x, y, center.z);
+            let index = self
+                .index(position)
+                .expect("edited direct-sky column remains inside the world");
+            if level > 0 {
+                let opacity = self.blocks[index].light_opacity();
+                if opacity > 0 || level < 15 {
+                    level = level.saturating_sub(opacity.max(1));
                 }
             }
+            if self.direct_sunlight[index] == level {
+                break;
+            }
+            self.direct_sunlight[index] = level;
+            Self::enqueue_light(queue, &mut self.light_queue_pending, index);
         }
     }
 
-    fn propagate_block_light_bounded(
+    fn relax_sunlight(
         &mut self,
         queue: &mut std::collections::VecDeque<usize>,
-        in_region: impl Fn(IVec3) -> bool,
+        changed: &mut LightUpdate,
     ) {
         while let Some(index) = queue.pop_front() {
-            let level = self.block_light[index];
-            if level <= 1 {
+            self.light_queue_pending[index] = 0;
+            let level = self.expected_sunlight(index);
+            if self.sunlight[index] == level {
                 continue;
             }
+            self.sunlight[index] = level;
             let position = self.position_of(index);
+            changed.include(position);
             for offset in [
                 IVec3::new(-1, 0, 0),
                 IVec3::new(1, 0, 0),
@@ -1043,20 +995,92 @@ impl World {
                 IVec3::new(0, 0, -1),
                 IVec3::new(0, 0, 1),
             ] {
-                let neighbor = position + offset;
-                if !in_region(neighbor) {
-                    continue;
-                }
-                let Some(neighbor_index) = self.index(neighbor) else {
+                let Some(neighbor) = self.index(position + offset) else {
                     continue;
                 };
-                let opacity = self.blocks[neighbor_index].light_opacity().max(1);
-                let spread = level.saturating_sub(opacity);
-                if spread > self.block_light[neighbor_index] {
-                    self.block_light[neighbor_index] = spread;
-                    queue.push_back(neighbor_index);
-                }
+                Self::enqueue_light(queue, &mut self.light_queue_pending, neighbor);
             }
+        }
+    }
+
+    fn relax_block_light(
+        &mut self,
+        queue: &mut std::collections::VecDeque<usize>,
+        changed: &mut LightUpdate,
+    ) {
+        while let Some(index) = queue.pop_front() {
+            self.light_queue_pending[index] = 0;
+            let level = self.expected_block_light(index);
+            if self.block_light[index] == level {
+                continue;
+            }
+            self.block_light[index] = level;
+            let position = self.position_of(index);
+            changed.include(position);
+            for offset in [
+                IVec3::new(-1, 0, 0),
+                IVec3::new(1, 0, 0),
+                IVec3::new(0, -1, 0),
+                IVec3::new(0, 1, 0),
+                IVec3::new(0, 0, -1),
+                IVec3::new(0, 0, 1),
+            ] {
+                let Some(neighbor) = self.index(position + offset) else {
+                    continue;
+                };
+                Self::enqueue_light(queue, &mut self.light_queue_pending, neighbor);
+            }
+        }
+    }
+
+    fn expected_sunlight(&self, index: usize) -> u8 {
+        let attenuation = self.blocks[index].light_opacity().max(1);
+        let position = self.position_of(index);
+        let mut level = self.direct_sunlight[index];
+        for offset in [
+            IVec3::new(-1, 0, 0),
+            IVec3::new(1, 0, 0),
+            IVec3::new(0, -1, 0),
+            IVec3::new(0, 1, 0),
+            IVec3::new(0, 0, -1),
+            IVec3::new(0, 0, 1),
+        ] {
+            let Some(neighbor) = self.index(position + offset) else {
+                continue;
+            };
+            level = level.max(self.sunlight[neighbor].saturating_sub(attenuation));
+        }
+        level
+    }
+
+    fn expected_block_light(&self, index: usize) -> u8 {
+        let attenuation = self.blocks[index].light_opacity().max(1);
+        let position = self.position_of(index);
+        let mut level = self.blocks[index].light_emission();
+        for offset in [
+            IVec3::new(-1, 0, 0),
+            IVec3::new(1, 0, 0),
+            IVec3::new(0, -1, 0),
+            IVec3::new(0, 1, 0),
+            IVec3::new(0, 0, -1),
+            IVec3::new(0, 0, 1),
+        ] {
+            let Some(neighbor) = self.index(position + offset) else {
+                continue;
+            };
+            level = level.max(self.block_light[neighbor].saturating_sub(attenuation));
+        }
+        level
+    }
+
+    fn enqueue_light(
+        queue: &mut std::collections::VecDeque<usize>,
+        pending: &mut [u8],
+        index: usize,
+    ) {
+        if pending[index] == 0 {
+            pending[index] = 1;
+            queue.push_back(index);
         }
     }
 
@@ -1956,10 +1980,20 @@ impl Player {
     ///
     /// The destroyed hit, or `None` if no solid block is in reach.
     pub fn break_block(&self, world: &mut World, reach: f32) -> Option<RaycastHit> {
+        self.break_block_with_light_update(world, reach)
+            .map(|(hit, _)| hit)
+    }
+
+    /// Destroy a targeted block and return the exact changed-light extent.
+    pub fn break_block_with_light_update(
+        &self,
+        world: &mut World,
+        reach: f32,
+    ) -> Option<(RaycastHit, LightUpdate)> {
         let hit = world.raycast(self.camera().position, self.camera().forward(), reach)?;
         if world.set(hit.position, Block::Air) {
-            world.recompute_light_around(hit.position, 17);
-            Some(hit)
+            let light_update = world.recompute_light_after_edit(hit.position);
+            Some((hit, light_update))
         } else {
             None
         }
@@ -1976,6 +2010,16 @@ impl Player {
     ///
     /// The placed coordinate, or `None` if there is no valid, unoccupied air cell.
     pub fn place_block(&self, world: &mut World, reach: f32) -> Option<IVec3> {
+        self.place_block_with_light_update(world, reach)
+            .map(|(position, _)| position)
+    }
+
+    /// Place the selected block and return the exact changed-light extent.
+    pub fn place_block_with_light_update(
+        &self,
+        world: &mut World,
+        reach: f32,
+    ) -> Option<(IVec3, LightUpdate)> {
         if !self.selected_block.is_placeable() {
             return None;
         }
@@ -1987,8 +2031,8 @@ impl Player {
             return None;
         }
         if world.set(target, self.selected_block) {
-            world.recompute_light_around(target, 17);
-            Some(target)
+            let light_update = world.recompute_light_after_edit(target);
+            Some((target, light_update))
         } else {
             None
         }
@@ -2313,8 +2357,8 @@ fn initial_t(origin: f32, direction: f32, step: i32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        Block, IVec3, Mat4, Mesh, Player, PlayerInput, SEA_LEVEL, Vec3, VisibleSpace, World,
-        mesh_chunk, mesh_chunk_lod, mesh_world, terrain_height,
+        Block, CHUNK_SIZE, IVec3, Mat4, Mesh, Player, PlayerInput, SEA_LEVEL, Vec3, VisibleSpace,
+        World, mesh_chunk, mesh_chunk_lod, mesh_world, terrain_height,
     };
 
     #[test]
@@ -2483,6 +2527,63 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn incremental_light_matches_full_recompute_through_mixed_edits() {
+        let mut world = World::generate_sized(0x51A7, 32, 20, 32);
+        let mut random = 0xD1B5_4A32_D192_ED03_u64;
+        let materials = [
+            Block::Air,
+            Block::Stone,
+            Block::Water,
+            Block::Leaves,
+            Block::Torch,
+        ];
+
+        for step in 0..96 {
+            random ^= random << 13;
+            random ^= random >> 7;
+            random ^= random << 17;
+            let x = (random % 32) as i32;
+            let y = ((random >> 8) % 20) as i32;
+            let z = ((random >> 16) % 32) as i32;
+            let block = materials[((random >> 24) as usize) % materials.len()];
+            let edit = IVec3::new(x, y, z);
+            world.set(edit, block);
+            world.recompute_light_after_edit(edit);
+
+            let mut reference = world.clone();
+            reference.recompute_light();
+            assert_eq!(
+                world.direct_sunlight, reference.direct_sunlight,
+                "direct sky mismatch after mixed edit {step} at {edit:?}"
+            );
+            assert_eq!(
+                world.sunlight, reference.sunlight,
+                "sky mismatch after mixed edit {step} at {edit:?}"
+            );
+            assert_eq!(
+                world.block_light, reference.block_light,
+                "block light mismatch after mixed edit {step} at {edit:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn torch_light_update_bounds_cross_chunk_edges() {
+        let mut world = World::new(48, 8, 16);
+        world.recompute_light();
+        let torch = IVec3::new(CHUNK_SIZE - 1, 3, 8);
+        world.set(torch, Block::Torch);
+        let update = world.recompute_light_after_edit(torch);
+        let (min_x, max_x, min_z, max_z) = update.horizontal_bounds().unwrap();
+
+        assert!(min_x < CHUNK_SIZE - 1);
+        assert!(max_x >= CHUNK_SIZE);
+        assert!(min_z < torch.z && max_z > torch.z);
+        assert_eq!(world.block_light(torch), 14);
+        assert_eq!(world.block_light(torch + IVec3::new(13, 0, 0)), 1);
     }
 
     #[test]

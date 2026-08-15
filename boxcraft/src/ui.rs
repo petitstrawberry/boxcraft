@@ -1,9 +1,10 @@
 //! ScarletUI frontend for Boxcraft.
 
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use boxcraft_core::{Block, Game, Mat4, Mesh, PlayerInput, Vec3, mesh_world};
+use boxcraft_core::{Block, CHUNK_SIZE, Game, Mat4, PlayerInput, Vec3, mesh_chunk};
 use scarlet_ui::prelude::*;
 use scarlet_ui::{
     ApplicationRunExt, ComponentElement, HeaderBar, KeyCode, KeyEvent, MouseButton, PlatformWindow,
@@ -19,13 +20,19 @@ const CAMERA_FOV: f32 = 70.0_f32.to_radians();
 const REACH: f32 = 6.0;
 const LOOK_SENSITIVITY: f32 = 0.003;
 const WORLD_SEED: u64 = 0xB0CA_FE00_2026_0001;
-const ATLAS_TILE_SIZE: u32 = 16;
+const ATLAS_TILE_SIZE: u32 = 32;
 const ATLAS_COLUMNS: u32 = 4;
-const ATLAS_ROWS: u32 = 3;
+const ATLAS_ROWS: u32 = 4;
 const DAY_LENGTH_SECONDS: f32 = 150.0;
-const SUNLIGHT_UPDATES_PER_SECOND: f32 = 8.0;
+const SUNLIGHT_UPDATES_PER_SECOND: f32 = 4.0;
 /// Number of retained textured terrain draws, from deepest shadow to sunlight.
-const TERRAIN_LIGHT_BUCKETS: usize = 4;
+const TERRAIN_LIGHT_BUCKETS: usize = 8;
+/// Terrain chunks built per idle tick while streaming the world in.
+const CHUNKS_PER_FRAME: usize = 3;
+/// Default and inclusive bounds for the configurable render distance.
+const DEFAULT_RENDER_DISTANCE: i32 = 3;
+const MIN_RENDER_DISTANCE: i32 = 1;
+const MAX_RENDER_DISTANCE: i32 = 6;
 
 /// Run the Boxcraft application.
 ///
@@ -64,6 +71,9 @@ struct Runtime {
     frames_since_sample: u32,
     day_seconds: f32,
     sunlight_step: u64,
+    build_queue: VecDeque<(i32, i32)>,
+    queued_chunks: HashSet<(i32, i32)>,
+    player_chunk: (i32, i32),
 }
 
 impl Runtime {
@@ -75,9 +85,15 @@ impl Runtime {
             frames_since_sample: 0,
             day_seconds: 0.0,
             sunlight_step: 0,
+            build_queue: VecDeque::new(),
+            queued_chunks: HashSet::new(),
+            player_chunk: (i32::MAX, i32::MAX),
         }
     }
 }
+
+/// The per-bucket GPU meshes of one streamed terrain chunk.
+type ChunkMeshes = [Option<Arc<SgfxMesh>>; TERRAIN_LIGHT_BUCKETS];
 
 #[derive(Clone)]
 struct BoxcraftApp {
@@ -90,9 +106,11 @@ struct BoxcraftApp {
     fullscreen_desired: State<bool>,
     fullscreen_applied: State<bool>,
     fullscreen_pending: State<bool>,
+    decorations_hidden: State<bool>,
+    settings_visible: State<bool>,
+    render_distance: State<i32>,
     canvas_frame: State<Arc<SgfxCanvasFrame>>,
-    terrain_mesh: State<Arc<Mesh>>,
-    terrain_meshes: State<Arc<[Option<Arc<SgfxMesh>>; TERRAIN_LIGHT_BUCKETS]>>,
+    chunk_meshes: State<Arc<HashMap<(i32, i32), Arc<ChunkMeshes>>>>,
     mesh_revision: State<u64>,
     frame_revision: State<u64>,
     sun_phase: State<f32>,
@@ -102,7 +120,7 @@ struct BoxcraftApp {
     selected_block: State<String>,
     status: State<String>,
     canvas_handle: SgfxCanvasHandle,
-    mesh_handles: [SgfxMeshHandle; TERRAIN_LIGHT_BUCKETS],
+    chunk_handles: Arc<Mutex<HashMap<(i32, i32), [SgfxMeshHandle; TERRAIN_LIGHT_BUCKETS]>>>,
     block_atlas: Arc<SgfxTexture>,
     runtime: Arc<Mutex<Runtime>>,
 }
@@ -127,9 +145,14 @@ impl BoxcraftApp {
             fullscreen_desired: State::new(StateId::new(7), false),
             fullscreen_applied: State::new(StateId::new(8), false),
             fullscreen_pending: State::new(StateId::new(9), false),
+            decorations_hidden: State::new(StateId::new(21), false),
+            settings_visible: State::new(StateId::new(22), false),
+            render_distance: State::new(StateId::new(23), DEFAULT_RENDER_DISTANCE),
             canvas_frame: State::new(StateId::new(10), initial_frame),
-            terrain_mesh: State::new(StateId::new(19), Arc::new(Mesh::default())),
-            terrain_meshes: State::new(StateId::new(11), Arc::new(std::array::from_fn(|_| None))),
+            chunk_meshes: State::new(
+                StateId::new(11),
+                Arc::new(HashMap::<(i32, i32), Arc<ChunkMeshes>>::new()),
+            ),
             mesh_revision: State::new(StateId::new(12), 0),
             frame_revision: State::new(StateId::new(13), 0),
             sun_phase: State::new(StateId::new(20), 0.0),
@@ -142,11 +165,11 @@ impl BoxcraftApp {
                 String::from("Click the terrain to capture the pointer"),
             ),
             canvas_handle: SgfxCanvasHandle::new(),
-            mesh_handles: std::array::from_fn(|_| SgfxMeshHandle::new()),
+            chunk_handles: Arc::new(Mutex::new(HashMap::new())),
             block_atlas: block_texture_atlas(),
             runtime: Arc::new(Mutex::new(Runtime::new())),
         };
-        app.rebuild_mesh();
+        app.refresh_chunk_set();
         app.update_hud();
         app.refresh_frame();
         app
@@ -181,12 +204,42 @@ impl BoxcraftApp {
         self.fullscreen_desired.set(!self.fullscreen_desired.get());
     }
 
+    fn change_render_distance(&self, delta: i32) {
+        self.render_distance.update(|distance| {
+            *distance = (*distance + delta).clamp(MIN_RENDER_DISTANCE, MAX_RENDER_DISTANCE)
+        });
+        self.refresh_chunk_set();
+        self.status.set(format!(
+            "Render distance: {} chunks",
+            self.render_distance.get()
+        ));
+    }
+
+    fn toggle_settings(&self) {
+        self.settings_visible.update(|visible| *visible = !*visible);
+    }
+
     fn reset_world(&self) {
         self.seed.update(|seed| *seed = seed.wrapping_add(1));
         let seed = self.seed.get();
         self.game.set(Arc::new(Mutex::new(Game::generated(seed))));
         self.clear_pressed_keys();
-        self.rebuild_mesh();
+        self.chunk_meshes
+            .update(|chunks| *chunks = Arc::new(HashMap::<(i32, i32), Arc<ChunkMeshes>>::new()));
+        self.chunk_handles
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        {
+            let mut runtime = self
+                .runtime
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            runtime.build_queue.clear();
+            runtime.queued_chunks.clear();
+            runtime.player_chunk = (i32::MAX, i32::MAX);
+        }
+        self.refresh_chunk_set();
         self.update_hud();
         self.status
             .set(String::from("Generated a fresh Boxcraft world"));
@@ -202,7 +255,11 @@ impl BoxcraftApp {
         match event {
             KeyEvent::Pressed { keycode, .. } => match keycode {
                 KeyCode::Escape => {
-                    self.release_pointer_lock();
+                    if self.settings_visible.get() {
+                        self.settings_visible.set(false);
+                    } else {
+                        self.release_pointer_lock();
+                    }
                     true
                 }
                 KeyCode::F(11) => {
@@ -238,7 +295,23 @@ impl BoxcraftApp {
                     true
                 }
                 KeyCode::Char('7') => {
-                    self.select_block(6, Block::Air);
+                    self.select_block(6, Block::Snow);
+                    true
+                }
+                KeyCode::Char('8') => {
+                    self.select_block(7, Block::Air);
+                    true
+                }
+                KeyCode::Char('o') | KeyCode::Char('O') => {
+                    self.settings_visible.update(|visible| *visible = !*visible);
+                    true
+                }
+                KeyCode::Char('-') | KeyCode::Char('_') => {
+                    self.change_render_distance(-1);
+                    true
+                }
+                KeyCode::Char('=') | KeyCode::Char('+') => {
+                    self.change_render_distance(1);
                     true
                 }
                 keycode if self.pointer_lock_applied.get() => self.set_movement_key(keycode, true),
@@ -292,34 +365,176 @@ impl BoxcraftApp {
             return true;
         }
 
+        let mut edited = None;
         let changed = self.with_game(|game| match button {
-            MouseButton::Left => game.player.break_block(&mut game.world, REACH).is_some(),
-            MouseButton::Right => game.player.place_block(&mut game.world, REACH).is_some(),
+            MouseButton::Left => {
+                edited = game
+                    .world
+                    .raycast(
+                        game.player.camera().position,
+                        game.player.camera().forward(),
+                        REACH,
+                    )
+                    .map(|hit| hit.position);
+                game.player.break_block(&mut game.world, REACH).is_some()
+            }
+            MouseButton::Right => {
+                edited = game
+                    .player
+                    .place_block(&mut game.world, REACH)
+                    .map(|position| position);
+                edited.is_some()
+            }
             MouseButton::Middle => false,
         });
         if changed {
-            self.rebuild_mesh();
+            if let Some(position) = edited {
+                self.rebuild_edited_chunks(position);
+            }
         }
         true
     }
 
-    fn rebuild_mesh(&self) {
-        self.terrain_mesh
-            .set(Arc::new(self.with_game(|game| mesh_world(&game.world))));
-        self.rebuild_render_mesh();
-        self.refresh_frame();
+    /// Rebuild the chunks touched by a block edit, plus neighbours when the
+    /// edit sits on a chunk border and affects their ambient occlusion.
+    fn rebuild_edited_chunks(&self, position: boxcraft_core::IVec3) {
+        let chunk = (
+            (position.x as i32).div_euclid(CHUNK_SIZE),
+            (position.z as i32).div_euclid(CHUNK_SIZE),
+        );
+        let local_x = position.x.rem_euclid(CHUNK_SIZE);
+        let local_z = position.z.rem_euclid(CHUNK_SIZE);
+        let mut rebuilt = false;
+        // Ambient occlusion and smooth light reach one block across the
+        // border, so only rebuild a neighbour when the edit is edge-adjacent.
+        let mut offsets = vec![(0, 0)];
+        if local_x == 0 {
+            offsets.extend([(-1, 0), (-1, -1), (-1, 1)]);
+        }
+        if local_x == CHUNK_SIZE - 1 {
+            offsets.extend([(1, 0), (1, -1), (1, 1)]);
+        }
+        if local_z == 0 {
+            offsets.extend([(0, -1)]);
+        }
+        if local_z == CHUNK_SIZE - 1 {
+            offsets.extend([(0, 1)]);
+        }
+        for offset in offsets {
+            rebuilt |= self.build_chunk(chunk.0 + offset.0, chunk.1 + offset.1);
+        }
+        if rebuilt {
+            self.refresh_frame();
+        }
     }
 
-    /// Rebuild the retained SGFX mesh from the latest terrain snapshot.
+    /// Reconcile the set of resident chunks with the player's render distance.
     ///
-    /// Terrain supplies local UVs, material identity, and ambient-occlusion
-    /// light. The frontend maps those values into the pixel atlas, then groups
-    /// complete triangles by their moving-sun illumination. Textured SGFX draws
-    /// use each group's uniform tint because that pipeline does not consume
-    /// per-vertex colors.
-    fn rebuild_render_mesh(&self) {
-        let core_mesh = self.terrain_mesh.get();
-        let sun_phase = self.sun_phase.get();
+    /// Chunks entering the range are queued for streaming build; chunks that
+    /// left it are dropped together with their GPU meshes.
+    fn refresh_chunk_set(&self) {
+        let player_chunk = self.with_game(|game| {
+            let position = game.player.position;
+            (
+                (position.x as i32).div_euclid(CHUNK_SIZE),
+                (position.z as i32).div_euclid(CHUNK_SIZE),
+            )
+        });
+        let distance = self.render_distance.get();
+        let desired: HashSet<(i32, i32)> = (-distance..=distance)
+            .flat_map(|dz| (-distance..=distance).map(move |dx| (dx, dz)))
+            .map(|(dx, dz)| (player_chunk.0 + dx, player_chunk.1 + dz))
+            .collect();
+
+        let removed: Vec<(i32, i32)> = self
+            .chunk_meshes
+            .get()
+            .keys()
+            .copied()
+            .filter(|chunk| !desired.contains(chunk))
+            .collect();
+        if !removed.is_empty() {
+            self.chunk_meshes.update(|chunks| {
+                let mut next = (**chunks).clone();
+                for chunk in &removed {
+                    next.remove(chunk);
+                }
+                *chunks = Arc::new(next);
+            });
+            self.chunk_handles
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .retain(|chunk, _| desired.contains(chunk));
+        }
+
+        let mut runtime = self
+            .runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let allowed: HashSet<(i32, i32)> = desired.clone();
+        runtime
+            .queued_chunks
+            .retain(|chunk| allowed.contains(chunk));
+        {
+            let queued = runtime.queued_chunks.clone();
+            runtime.build_queue.retain(|chunk| queued.contains(chunk));
+        }
+        runtime.player_chunk = player_chunk;
+        let mut missing: Vec<(i32, i32)> = desired
+            .into_iter()
+            .filter(|chunk| {
+                !self.chunk_meshes.get().contains_key(chunk)
+                    && !runtime.queued_chunks.contains(chunk)
+            })
+            .collect();
+        missing.sort_by_key(|chunk| {
+            (chunk.0 - player_chunk.0)
+                .abs()
+                .max((chunk.1 - player_chunk.1).abs())
+        });
+        for chunk in missing {
+            runtime.queued_chunks.insert(chunk);
+            runtime.build_queue.push_back(chunk);
+        }
+    }
+
+    /// Stream a few queued chunks into GPU meshes; returns whether any moved.
+    fn process_build_queue(&self, budget: usize) -> bool {
+        let mut built = false;
+        for _ in 0..budget {
+            let next = {
+                let mut runtime = self
+                    .runtime
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                loop {
+                    match runtime.build_queue.pop_front() {
+                        Some(chunk) => {
+                            runtime.queued_chunks.remove(&chunk);
+                            break Some(chunk);
+                        }
+                        None => break None,
+                    }
+                }
+            };
+            let Some(chunk) = next else { break };
+            built |= self.build_chunk(chunk.0, chunk.1);
+        }
+        built
+    }
+
+    /// Build one chunk's retained SGFX meshes from the live world snapshot.
+    ///
+    /// Terrain supplies local UVs, material identity, and baked sky-light and
+    /// ambient-occlusion values. The frontend maps those into the pixel atlas,
+    /// then groups complete triangles by static illumination. Textured SGFX
+    /// draws use each group's uniform tint because that pipeline does not
+    /// consume per-vertex colors; the moving sun lives in the tint alone.
+    fn build_chunk(&self, chunk_x: i32, chunk_z: i32) -> bool {
+        let core_mesh = self.with_game(|game| mesh_chunk(&game.world, chunk_x, chunk_z));
+        if core_mesh.vertices.is_empty() {
+            return false;
+        }
         let mut bucket_vertices: [Vec<SgfxCanvasVertex>; TERRAIN_LIGHT_BUCKETS] =
             std::array::from_fn(|_| Vec::new());
 
@@ -334,7 +549,7 @@ impl BoxcraftApp {
             ) else {
                 continue;
             };
-            let bucket = terrain_triangle_light_bucket([first, second, third], sun_phase);
+            let bucket = terrain_triangle_light_bucket([first, second, third]);
             let vertices = &mut bucket_vertices[bucket];
             for vertex in [first, second, third] {
                 vertices.push(
@@ -356,12 +571,24 @@ impl BoxcraftApp {
         self.mesh_revision
             .update(|revision| *revision = revision.wrapping_add(1));
         let revision = self.mesh_revision.get();
+        let handles = self
+            .chunk_handles
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry((chunk_x, chunk_z))
+            .or_insert_with(|| std::array::from_fn(|_| SgfxMeshHandle::new()))
+            .clone();
         let meshes = std::array::from_fn(|bucket| {
             let vertices = core::mem::take(&mut bucket_vertices[bucket]);
             (!vertices.is_empty())
-                .then(|| SgfxMesh::with_handle(self.mesh_handles[bucket], revision, vertices))
+                .then(|| SgfxMesh::with_handle(handles[bucket], revision, vertices))
         });
-        self.terrain_meshes.set(Arc::new(meshes));
+        self.chunk_meshes.update(|chunks| {
+            let mut next = (**chunks).clone();
+            next.insert((chunk_x, chunk_z), Arc::new(meshes));
+            *chunks = Arc::new(next);
+        });
+        true
     }
 
     fn refresh_frame(&self) {
@@ -378,15 +605,17 @@ impl BoxcraftApp {
                 .depth_tested()
                 // The SGFX renderer corrects this reference perspective as its canvas resizes.
                 .reference_aspect(REFERENCE_ASPECT);
-        let terrain_meshes = self.terrain_meshes.get();
+        let chunk_meshes = self.chunk_meshes.get();
         let sun_phase = self.sun_phase.get();
-        for (bucket, mesh) in terrain_meshes.iter().enumerate() {
-            if let Some(mesh) = mesh {
-                frame = frame.draw(
-                    SgfxCanvasDraw::new(Arc::clone(mesh), transform)
-                        .tint(terrain_bucket_tint(bucket, sun_phase))
-                        .texture(Arc::clone(&self.block_atlas)),
-                );
+        for meshes in chunk_meshes.values() {
+            for (bucket, mesh) in meshes.iter().enumerate() {
+                if let Some(mesh) = mesh {
+                    frame = frame.draw(
+                        SgfxCanvasDraw::new(Arc::clone(mesh), transform)
+                            .tint(terrain_bucket_tint(bucket, sun_phase))
+                            .texture(Arc::clone(&self.block_atlas)),
+                    );
+                }
             }
         }
         self.canvas_frame.set(Arc::new(frame));
@@ -415,14 +644,23 @@ impl BoxcraftApp {
         let canvas_input = self.clone();
         let key_input = self.clone();
         let pointer_delta = self.clone();
+        let settings_toggle = self.clone();
+        let distance_down = self.clone();
+        let distance_up = self.clone();
+        let settings_close = self.clone();
         let pointer_locked = self.pointer_lock_applied.get();
         let fullscreen_desired = self.fullscreen_desired.get();
+        let settings_open = self.settings_visible.get();
+        let render_distance = self.render_distance.get();
 
         let controls = scarlet_ui::if_view!(
             !pointer_locked,
             hstack! {
                 Button::new("Capture pointer").header_style().on_click(move || capture.request_pointer_lock()),
                 Button::new("Reset world").header_style().on_click(move || reset.reset_world()),
+                Button::new(if settings_open { "Hide settings" } else { "Settings" })
+                    .header_style()
+                    .on_click(move || settings_toggle.toggle_settings()),
                 Button::new(if fullscreen_desired { "Exit fullscreen" } else { "Fullscreen" })
                     .header_style()
                     .on_click(move || fullscreen.toggle_fullscreen()),
@@ -453,6 +691,19 @@ impl BoxcraftApp {
         let game_area = zstack! {
             canvas,
             Text::new("+").font_size(28.0).color(Color::rgb(0.95, 0.95, 0.98)),
+            scarlet_ui::if_view!(
+                settings_open,
+                hstack! {
+                    Text::new(format!("Render distance: {render_distance} chunks")).font_size(13.0),
+                    Button::new("−").on_click(move || distance_down.change_render_distance(-1)),
+                    Button::new("+").on_click(move || distance_up.change_render_distance(1)),
+                    Button::new("Close").on_click(move || settings_close.toggle_settings()),
+                }
+                .spacing(10.0)
+                .padding(12.0)
+                .background(Color::rgba(0.03, 0.04, 0.07, 0.88)),
+                Spacer::new()
+            ),
         }
         .alignment(Alignment::Center)
         .frame(f32::INFINITY, f32::INFINITY)
@@ -462,7 +713,7 @@ impl BoxcraftApp {
         let pointer_help = if pointer_locked {
             String::from("Esc to release · Left break · Right place · WASD + Space to move")
         } else {
-            String::from("Click to capture pointer · UI controls are available while unlocked")
+            String::from("Click to capture pointer · O settings · +/- render distance")
         };
         vstack! {
             header,
@@ -495,6 +746,9 @@ impl View for BoxcraftApp {
         vec![
             &self.pointer_lock_applied as &dyn scarlet_ui::Listenable,
             &self.fullscreen_desired as &dyn scarlet_ui::Listenable,
+            &self.decorations_hidden as &dyn scarlet_ui::Listenable,
+            &self.settings_visible as &dyn scarlet_ui::Listenable,
+            &self.render_distance as &dyn scarlet_ui::Listenable,
         ]
     }
 
@@ -549,9 +803,17 @@ impl Application for BoxcraftApp {
         self.fullscreen_pending.set(false);
         self.fullscreen_applied.set(fullscreen);
         self.fullscreen_desired.set(fullscreen);
+        // Match vellum: a real fullscreen window also hides its decorations,
+        // otherwise the compositor keeps the title bar and it just maximizes.
+        self.decorations_hidden.set(fullscreen);
     }
 
     fn on_window_resize(&mut self, _ctx: &WindowContext, _width: u32, _height: u32) {
+        if self.fullscreen_applied.get() == self.fullscreen_desired.get()
+            && self.decorations_hidden.get() != self.fullscreen_desired.get()
+        {
+            self.decorations_hidden.set(self.fullscreen_desired.get());
+        }
         self.refresh_frame();
     }
 
@@ -601,8 +863,10 @@ impl Application for BoxcraftApp {
         });
         if let Some(sun_phase) = sun_phase {
             self.sun_phase.set(sun_phase);
-            self.rebuild_render_mesh();
         }
+        // Stream terrain chunks around the player and drop distant ones.
+        self.refresh_chunk_set();
+        self.process_build_queue(CHUNKS_PER_FRAME);
         if let Some(fps) = fps {
             self.fps.set(fps);
             self.fps_text.set(format!("FPS: {fps}"));
@@ -616,6 +880,7 @@ impl Application for BoxcraftApp {
             "main",
             Window::new("Boxcraft", self.clone())
                 .app_id(APP_ID)
+                .decorated(!self.decorations_hidden.get())
                 .size(Size::new(WINDOW_WIDTH, WINDOW_HEIGHT))
                 .min_size(Size::new(720.0, 480.0))
                 .resizable(true),
@@ -646,54 +911,138 @@ fn block_texture_atlas() -> Arc<SgfxTexture> {
 }
 
 fn atlas_pixel(tile: usize, x: u32, y: u32) -> [u8; 4] {
-    let noise = pixel_noise(tile as u32, x, y);
-    let shade = match noise & 0b11 {
-        0 => -12,
-        1 => -4,
-        2 => 4,
-        _ => 10,
-    };
+    // Fractal noise evaluated in continuous tile space: several octaves of
+    // smooth value noise replace the per-pixel hash that read as harsh
+    // mosaic static at a distance.
+    let fx = x as f32;
+    let fy = y as f32;
+    let grain = tile_fbm(tile as u32, fx, fy, 4.0, 4);
+    let detail = tile_fbm(tile as u32 ^ 0x5EED, fx, fy, 8.0, 3);
+    let clumps = tile_fbm(tile as u32 ^ 0xC0FFEE, fx, fy, 2.0, 2);
+    let shade = (grain * 22.0 + detail * 12.0) as i16;
     let mut color = match tile {
-        // Grass top: rich blades with sparse dry speckles.
-        0 if noise % 19 == 0 => [118, 142, 56],
-        0 => [70, 143, 56],
-        // Grass sides have a short turf cap over soil.
-        1 if y < 4 || (y == 4 && noise % 3 != 0) => [68, 140, 55],
-        1 => [124, 77, 43],
-        // Dirt.
-        2 => [126, 78, 44],
-        // Stone, with occasional darker fracture pixels.
-        3 if (x + y * 3) % 11 == 0 || noise % 23 == 0 => [87, 94, 102],
-        3 => [119, 126, 132],
-        // Wood bark: vertical dark grain.
-        4 if x % 5 == 0 || (x + y) % 13 == 0 => [76, 48, 28],
-        4 => [133, 85, 43],
-        // Wood end grain: a simple square ring.
-        5 if x
-            .min(y)
-            .min(ATLAS_TILE_SIZE - 1 - x)
-            .min(ATLAS_TILE_SIZE - 1 - y)
-            % 4
-            == 0 =>
-        {
-            [95, 57, 30]
+        // Grass top: broad clump tinting over fine blade detail.
+        0 => {
+            let dry = ((clumps - 0.15) / 0.85).clamp(0.0, 1.0);
+            [
+                66 + dry as i16 as u8 * 0 + (dry * 52.0) as u8,
+                138 + (dry * 6.0) as u8,
+                52 + (dry * 8.0) as u8,
+            ]
         }
-        5 => [157, 105, 55],
-        // Leaves: dense green clusters, kept opaque for stable depth writes.
-        6 if noise % 7 == 0 => [45, 96, 45],
-        6 => [53, 126, 54],
-        // Sand.
-        7 if noise % 13 == 0 => [202, 175, 105],
-        7 => [222, 194, 121],
-        // Water: a blue tile with a subtle horizontal current.
-        8 if (x + y * 2) % 9 < 2 => [71, 156, 203],
-        8 => [48, 121, 183],
+        // Grass sides: a turf cap with an organic, noise-driven edge.
+        1 => {
+            let edge = 5.0 + clumps * 3.0;
+            if fy < edge {
+                [64 + (grain * 10.0) as u8, 132, 50]
+            } else {
+                [124, 77, 43]
+            }
+        }
+        // Dirt: pebbly clumps.
+        2 => [118 + (clumps * 16.0) as u8, 74 + (clumps * 10.0) as u8, 42],
+        // Stone: banded mineral with fracture creases.
+        3 => {
+            let crease = (detail.abs() * 26.0) as u8;
+            [112 - crease, 120 - crease, 127 - crease]
+        }
+        // Wood bark: stretched vertical grain.
+        4 => {
+            let streak = tile_fbm(tile as u32, fx * 0.22, fy * 1.6, 3.0, 3);
+            let dark = (streak * 30.0) as u8;
+            [133 - dark, 85 - dark, 43 - dark]
+        }
+        // Wood end grain: concentric rings around the tile centre.
+        5 => {
+            let dx = fx - ATLAS_TILE_SIZE as f32 * 0.5;
+            let dy = fy - ATLAS_TILE_SIZE as f32 * 0.5;
+            let ring = ((dx * dx + dy * dy).sqrt() * 0.9 + grain * 1.8).sin();
+            if ring > 0.55 {
+                [112, 67, 34]
+            } else {
+                [157, 105, 55]
+            }
+        }
+        // Leaves: dense foliage clumping, kept opaque for depth writes.
+        6 => {
+            let depth = ((clumps + 1.0) * 0.5).clamp(0.0, 1.0);
+            [
+                (38.0 + depth * 22.0) as u8,
+                (96.0 + depth * 44.0) as u8,
+                (36.0 + depth * 22.0) as u8,
+            ]
+        }
+        // Sand: soft wind ripples.
+        7 => {
+            let ripple = ((fy * 0.7 + grain * 6.0).sin() * 8.0) as i16;
+            let base = 218 + ripple as u8;
+            [base, (base as i16 - 27) as u8, (base as i16 - 92) as u8]
+        }
+        // Water: gentle layered current.
+        8 => {
+            let wave = ((fx * 0.35 + fy * 0.2 + grain * 4.0).sin() * 0.5 + 0.5) * 14.0;
+            [
+                (46.0 + wave) as u8,
+                (118.0 + wave) as u8,
+                (180.0 + wave * 0.6) as u8,
+            ]
+        }
+        // Snow: bright with sparse blue-grey shadow pockets.
+        9 => {
+            let pocket = ((clumps + 1.0) * 0.5).clamp(0.0, 1.0);
+            [
+                (216.0 + pocket * 34.0) as u8,
+                (222.0 + pocket * 30.0) as u8,
+                (230.0 + pocket * 24.0) as u8,
+            ]
+        }
         _ => [255, 0, 255],
     };
     for component in &mut color {
         *component = ((i16::from(*component) + shade).clamp(0, 255)) as u8;
     }
     [color[0], color[1], color[2], 255]
+}
+
+/// Smooth multi-octave value noise wrapped inside one atlas tile.
+fn tile_fbm(seed: u32, x: f32, y: f32, wavelength: f32, octaves: u32) -> f32 {
+    let mut sum = 0.0;
+    let mut amplitude = 1.0;
+    let mut total = 0.0;
+    let mut scale = wavelength;
+    for octave in 0..octaves {
+        sum +=
+            tile_value_noise(seed.wrapping_add(octave.wrapping_mul(101)), x, y, scale) * amplitude;
+        total += amplitude;
+        amplitude *= 0.5;
+        scale *= 0.5;
+    }
+    sum / total
+}
+
+fn tile_value_noise(seed: u32, x: f32, y: f32, wavelength: f32) -> f32 {
+    let tile = ATLAS_TILE_SIZE as f32;
+    // Coordinates wrap around the tile so textures tile seamlessly.
+    let gx = (x / wavelength).floor();
+    let gy = (y / wavelength).floor();
+    let fx = x / wavelength - gx;
+    let fy = y / wavelength - gy;
+    let blend_x = fx * fx * (3.0 - 2.0 * fx);
+    let blend_y = fy * fy * (3.0 - 2.0 * fy);
+    let sample = |ix: f32, iy: f32| {
+        let wrapped_x = ix.rem_euclid(tile / wavelength);
+        let wrapped_y = iy.rem_euclid(tile / wavelength);
+        let bits = pixel_noise(
+            seed,
+            (wrapped_x * wavelength) as u32 % ATLAS_TILE_SIZE,
+            (wrapped_y * wavelength) as u32 % ATLAS_TILE_SIZE,
+        );
+        bits as f32 / u32::MAX as f32 * 2.0 - 1.0
+    };
+    let lerp = |from: f32, to: f32, amount: f32| from + (to - from) * amount;
+    let north = lerp(sample(gx, gy), sample(gx + 1.0, gy), blend_x);
+    let south = lerp(sample(gx, gy + 1.0), sample(gx + 1.0, gy + 1.0), blend_x);
+    lerp(north, south, blend_y)
 }
 
 fn pixel_noise(tile: u32, x: u32, y: u32) -> u32 {
@@ -739,6 +1088,7 @@ fn block_texture_tile(block: Block, normal: Vec3) -> u32 {
         Block::Leaves => 6,
         Block::Sand => 7,
         Block::Water => 8,
+        Block::Snow => 9,
         Block::Air => 0,
     }
 }
@@ -748,17 +1098,10 @@ fn block_texture_tile(block: Block, normal: Vec3) -> u32 {
 /// Textured SGFX draws apply one tint uniform per draw, rather than a color
 /// per vertex. Averaging the three source corners makes each triangle's shadow
 /// band stable while retaining both baked AO and moving sun direction.
-fn terrain_triangle_light_bucket(vertices: [&boxcraft_core::Vertex; 3], sun_phase: f32) -> usize {
+fn terrain_triangle_light_bucket(vertices: [&boxcraft_core::Vertex; 3]) -> usize {
     let brightness = vertices
         .into_iter()
-        .map(|vertex| {
-            sunlight_brightness(
-                vertex.normal,
-                vertex.light,
-                vertex.ambient_occlusion,
-                sun_phase,
-            )
-        })
+        .map(|vertex| sunlight_brightness(vertex.light, vertex.ambient_occlusion))
         .sum::<f32>()
         / 3.0;
     terrain_light_bucket(brightness)
@@ -787,18 +1130,14 @@ fn terrain_bucket_tint(bucket: usize, sun_phase: f32) -> Color {
 }
 
 /// Combine a moving directional sun with the terrain's baked occlusion light.
-fn sunlight_brightness(
-    normal: Vec3,
-    sky_light: f32,
-    ambient_occlusion: f32,
-    sun_phase: f32,
-) -> f32 {
-    let sun = sunlight_direction(sun_phase);
-    let daylight = sunlight_daylight(sun_phase);
-    let direct = normal.dot(sun).max(0.0) * daylight;
-    let ambient = 0.08 + daylight * 0.12 + sky_light.clamp(0.0, 1.0) * (0.10 + daylight * 0.22);
+/// Combine the baked propagated sky light with corner ambient occlusion.
+///
+/// The value is static per vertex: the moving sun is applied later as the
+/// bucket draw tint, so day and night cycle without remeshing terrain.
+fn sunlight_brightness(sky_light: f32, ambient_occlusion: f32) -> f32 {
+    let ambient = 0.10 + sky_light.clamp(0.0, 1.0) * 0.90;
     let occlusion = 0.52 + ambient_occlusion.clamp(0.0, 1.0) * 0.48;
-    ((ambient + direct * 0.68) * occlusion).clamp(0.0, 1.0)
+    (ambient * occlusion).clamp(0.0, 1.0)
 }
 
 /// Return the normalized directional sun vector for a day-cycle phase.
@@ -827,6 +1166,7 @@ fn block_name(block: Block) -> &'static str {
         Block::Leaves => "Leaves",
         Block::Sand => "Sand",
         Block::Water => "Water",
+        Block::Snow => "Snow",
     }
 }
 

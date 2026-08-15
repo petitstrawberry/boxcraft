@@ -34,6 +34,9 @@ const MAX_RENDER_DISTANCE: i32 = 6;
 /// Chunks within this Chebyshev radius keep individual meshes for edits. Each
 /// chunk now has one textured draw; illumination is carried by its vertices.
 const NEAR_CHUNK_RADIUS: i32 = 2;
+/// Far meshes combine a small tile of chunks to keep SGFX draw-state commands
+/// below its opaque command-stream limit while retaining coarse culling.
+const FAR_MESH_GROUP_SIZE: i32 = 2;
 
 /// Run the Boxcraft application.
 ///
@@ -126,6 +129,7 @@ struct BoxcraftApp {
     status: State<String>,
     canvas_handle: SgfxCanvasHandle,
     chunk_handles: Arc<Mutex<HashMap<(i32, i32), SgfxMeshHandle>>>,
+    far_handles: Arc<Mutex<HashMap<(i32, i32), SgfxMeshHandle>>>,
     handle_pool: Arc<Mutex<Vec<SgfxMeshHandle>>>,
     block_atlas: Arc<SgfxTexture>,
     runtime: Arc<Mutex<Runtime>>,
@@ -184,6 +188,7 @@ impl BoxcraftApp {
             ),
             canvas_handle: SgfxCanvasHandle::new(),
             chunk_handles: Arc::new(Mutex::new(HashMap::new())),
+            far_handles: Arc::new(Mutex::new(HashMap::new())),
             handle_pool: Arc::new(Mutex::new(Vec::new())),
             block_atlas: block_texture_atlas(),
             runtime: Arc::new(Mutex::new(Runtime::new())),
@@ -250,10 +255,17 @@ impl BoxcraftApp {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             handles.drain().map(|(_, handles)| handles).collect()
         };
+        let retired_far: Vec<SgfxMeshHandle> = {
+            let mut handles = self
+                .far_handles
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            handles.drain().map(|(_, handle)| handle).collect()
+        };
         self.handle_pool
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .extend(retired);
+            .extend(retired.into_iter().chain(retired_far));
         self.near_meshes
             .update(|chunks| *chunks = Arc::new(HashMap::<(i32, i32), Arc<SgfxMesh>>::new()));
         self.near_core_meshes.set(Arc::new(
@@ -555,35 +567,7 @@ impl BoxcraftApp {
                 .extend(retired);
         }
 
-        // A chunk can move from the far ring into the near ring while the
-        // rebuild is still deferred. Remove its old far draw immediately so
-        // the same handle is never submitted with two revisions in one frame.
         let far_set: HashSet<(i32, i32)> = far.iter().copied().collect();
-        let stale_far: Vec<(i32, i32)> = self
-            .far_meshes
-            .get()
-            .keys()
-            .copied()
-            .filter(|chunk| !far_set.contains(chunk))
-            .collect();
-        if !stale_far.is_empty() {
-            changed = true;
-            self.far_core_meshes.update(|meshes| {
-                let mut next = (**meshes).clone();
-                for chunk in &stale_far {
-                    next.remove(chunk);
-                }
-                *meshes = Arc::new(next);
-            });
-            self.far_meshes.update(|meshes| {
-                let mut next = (**meshes).clone();
-                for chunk in &stale_far {
-                    next.remove(chunk);
-                }
-                *meshes = Arc::new(next);
-            });
-        }
-
         let mut runtime = self
             .runtime
             .lock()
@@ -600,6 +584,13 @@ impl BoxcraftApp {
         if runtime.far_chunks != far {
             runtime.far_chunks = far;
             runtime.far_dirty = true;
+            self.far_core_meshes.update(|meshes| {
+                let mut next = (**meshes).clone();
+                next.retain(|chunk, _| far_set.contains(chunk));
+                *meshes = Arc::new(next);
+            });
+            self.far_meshes
+                .set(Arc::new(HashMap::<(i32, i32), Arc<SgfxMesh>>::new()));
             changed = true;
         }
         let mut missing: Vec<(i32, i32)> = desired
@@ -670,6 +661,7 @@ impl BoxcraftApp {
             .clone();
         let cached_core_meshes = self.far_core_meshes.get();
         let mut core_meshes = HashMap::with_capacity(far_chunks.len());
+        let mut groups: HashMap<(i32, i32), Vec<Arc<boxcraft_core::Mesh>>> = HashMap::new();
         let mut meshes = HashMap::with_capacity(far_chunks.len());
         self.mesh_revision
             .update(|revision| *revision = revision.wrapping_add(1));
@@ -680,17 +672,26 @@ impl BoxcraftApp {
                 Arc::new(self.with_game(|game| mesh_chunk_lod(&game.world, chunk_x, chunk_z)))
             });
             core_meshes.insert(key, Arc::clone(&core_mesh));
+            let group = (
+                chunk_x.div_euclid(FAR_MESH_GROUP_SIZE),
+                chunk_z.div_euclid(FAR_MESH_GROUP_SIZE),
+            );
+            groups.entry(group).or_default().push(core_mesh);
+        }
+        for (group, core_meshes) in groups {
             let mut vertices = Vec::new();
-            append_lit_vertices(&core_mesh, self.sun_phase.get(), &mut vertices);
+            for core_mesh in core_meshes {
+                append_lit_vertices(&core_mesh, self.sun_phase.get(), &mut vertices);
+            }
             if vertices.is_empty() {
                 continue;
             }
             let handle = {
                 let mut active = self
-                    .chunk_handles
+                    .far_handles
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if let Some(handle) = active.get(&key) {
+                if let Some(handle) = active.get(&group) {
                     *handle
                 } else {
                     let handle = self
@@ -699,33 +700,30 @@ impl BoxcraftApp {
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .pop()
                         .unwrap_or_else(SgfxMeshHandle::new);
-                    active.insert(key, handle);
+                    active.insert(group, handle);
                     handle
                 }
             };
-            meshes.insert(key, SgfxMesh::with_handle(handle, revision, vertices));
+            meshes.insert(group, SgfxMesh::with_handle(handle, revision, vertices));
         }
         self.far_core_meshes.set(Arc::new(core_meshes));
 
-        // Retire handles for chunks that are no longer resident, but retain
-        // handles shared by the near ring so a far-to-near transition can
-        // update the existing renderer buffer safely.
-        let near_chunks = self.near_meshes.get();
+        // Retire handles for groups that are no longer resident.
         let stale_handles: Vec<(i32, i32)> = {
             let handles = self
-                .chunk_handles
+                .far_handles
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             handles
                 .keys()
                 .copied()
-                .filter(|chunk| !near_chunks.contains_key(chunk) && !meshes.contains_key(chunk))
+                .filter(|group| !meshes.contains_key(group))
                 .collect()
         };
         if !stale_handles.is_empty() {
             let retired: Vec<SgfxMeshHandle> = {
                 let mut handles = self
-                    .chunk_handles
+                    .far_handles
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 stale_handles
@@ -825,7 +823,13 @@ impl BoxcraftApp {
         let far_meshes = self.far_meshes.get();
         for (_, mesh) in far_meshes.iter().filter(|(chunk, mesh)| {
             mesh.triangle_count() > 0
-                && chunk_is_visible(camera.position, camera.forward(), **chunk)
+                && chunk_is_visible(
+                    camera.position,
+                    camera.forward(),
+                    (**chunk).0 * FAR_MESH_GROUP_SIZE,
+                    (**chunk).1 * FAR_MESH_GROUP_SIZE,
+                    FAR_MESH_GROUP_SIZE,
+                )
         }) {
             frame = frame.draw(
                 SgfxCanvasDraw::new(Arc::clone(mesh), transform)
@@ -836,7 +840,13 @@ impl BoxcraftApp {
         let near_meshes = self.near_meshes.get();
         for (_, meshes) in near_meshes.iter().filter(|(chunk, mesh)| {
             mesh.triangle_count() > 0
-                && chunk_is_visible(camera.position, camera.forward(), **chunk)
+                && chunk_is_visible(
+                    camera.position,
+                    camera.forward(),
+                    (**chunk).0,
+                    (**chunk).1,
+                    1,
+                )
         }) {
             frame = frame.draw(
                 SgfxCanvasDraw::new(Arc::clone(meshes), transform)
@@ -1430,11 +1440,17 @@ fn block_name(block: Block) -> &'static str {
 /// This is intentionally conservative: the chunk's diagonal plus a small
 /// margin is treated as a circle, so a face at the edge of the viewport is not
 /// clipped just because its chunk centre is outside the exact FOV.
-fn chunk_is_visible(camera_position: Vec3, camera_forward: Vec3, chunk: (i32, i32)) -> bool {
+fn chunk_is_visible(
+    camera_position: Vec3,
+    camera_forward: Vec3,
+    origin_x: i32,
+    origin_z: i32,
+    span: i32,
+) -> bool {
     let center = Vec3::new(
-        chunk.0 as f32 * CHUNK_SIZE as f32 + CHUNK_SIZE as f32 * 0.5,
+        origin_x as f32 * CHUNK_SIZE as f32 + CHUNK_SIZE as f32 * span as f32 * 0.5,
         camera_position.y,
-        chunk.1 as f32 * CHUNK_SIZE as f32 + CHUNK_SIZE as f32 * 0.5,
+        origin_z as f32 * CHUNK_SIZE as f32 + CHUNK_SIZE as f32 * span as f32 * 0.5,
     );
     let to_chunk = center - camera_position;
     let distance = (to_chunk.x * to_chunk.x + to_chunk.z * to_chunk.z).sqrt();
@@ -1444,7 +1460,7 @@ fn chunk_is_visible(camera_position: Vec3, camera_forward: Vec3, chunk: (i32, i3
     }
 
     let direction = Vec3::new(to_chunk.x / distance, 0.0, to_chunk.z / distance);
-    let chunk_radius = CHUNK_SIZE as f32 * core::f32::consts::SQRT_2 * 0.5 + 2.0;
+    let chunk_radius = CHUNK_SIZE as f32 * span as f32 * core::f32::consts::SQRT_2 * 0.5 + 2.0;
     let angular_margin = (chunk_radius / distance).clamp(0.0, 1.0).asin();
     let half_fov = CAMERA_FOV * 0.5 + angular_margin + 0.08;
     direction.dot(horizontal_forward) >= half_fov.min(core::f32::consts::PI).cos()

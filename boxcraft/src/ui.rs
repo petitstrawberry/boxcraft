@@ -4,7 +4,10 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use boxcraft_core::{Block, CHUNK_SIZE, Game, Mat4, PlayerInput, Vec3, mesh_chunk, mesh_chunk_lod};
+use boxcraft_core::{
+    Block, CHUNK_SIZE, Game, IVec3, Mat4, PlayerInput, Vec3, VisibleSpace, mesh_chunk,
+    mesh_chunk_lod,
+};
 use scarlet_ui::prelude::*;
 use scarlet_ui::{
     ApplicationRunExt, ComponentElement, HeaderBar, KeyCode, KeyEvent, MouseButton, PlatformWindow,
@@ -131,6 +134,7 @@ struct BoxcraftApp {
     chunk_handles: Arc<Mutex<HashMap<(i32, i32), SgfxMeshHandle>>>,
     far_handles: Arc<Mutex<HashMap<(i32, i32), SgfxMeshHandle>>>,
     handle_pool: Arc<Mutex<Vec<SgfxMeshHandle>>>,
+    visible_space: Arc<Mutex<Option<Arc<VisibleSpace>>>>,
     block_atlas: Arc<SgfxTexture>,
     runtime: Arc<Mutex<Runtime>>,
 }
@@ -190,6 +194,7 @@ impl BoxcraftApp {
             chunk_handles: Arc::new(Mutex::new(HashMap::new())),
             far_handles: Arc::new(Mutex::new(HashMap::new())),
             handle_pool: Arc::new(Mutex::new(Vec::new())),
+            visible_space: Arc::new(Mutex::new(None)),
             block_atlas: block_texture_atlas(),
             runtime: Arc::new(Mutex::new(Runtime::new())),
         };
@@ -276,6 +281,10 @@ impl BoxcraftApp {
         ));
         self.far_meshes
             .set(Arc::new(HashMap::<(i32, i32), Arc<SgfxMesh>>::new()));
+        *self
+            .visible_space
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         {
             let mut runtime = self
                 .runtime
@@ -484,6 +493,10 @@ impl BoxcraftApp {
             ));
             self.far_meshes
                 .set(Arc::new(HashMap::<(i32, i32), Arc<SgfxMesh>>::new()));
+            *self
+                .visible_space
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
             self.runtime
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -663,13 +676,37 @@ impl BoxcraftApp {
         let mut core_meshes = HashMap::with_capacity(far_chunks.len());
         let mut groups: HashMap<(i32, i32), Vec<Arc<boxcraft_core::Mesh>>> = HashMap::new();
         let mut meshes = HashMap::with_capacity(far_chunks.len());
+        let game_state = self.game.get();
+        let game = game_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let visible_space = {
+            let mut cached = self
+                .visible_space
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            Arc::clone(cached.get_or_insert_with(|| {
+                let camera = game.player.camera().position;
+                let viewer = IVec3::new(
+                    camera.x.floor() as i32,
+                    camera.y.floor() as i32,
+                    camera.z.floor() as i32,
+                );
+                Arc::new(VisibleSpace::from_world(&game.world, viewer))
+            }))
+        };
         self.mesh_revision
             .update(|revision| *revision = revision.wrapping_add(1));
         let revision = self.mesh_revision.get();
         for (chunk_x, chunk_z) in far_chunks.iter().copied() {
             let key = (chunk_x, chunk_z);
             let core_mesh = cached_core_meshes.get(&key).cloned().unwrap_or_else(|| {
-                Arc::new(self.with_game(|game| mesh_chunk_lod(&game.world, chunk_x, chunk_z)))
+                Arc::new(mesh_chunk_lod(
+                    &game.world,
+                    chunk_x,
+                    chunk_z,
+                    &visible_space,
+                ))
             });
             core_meshes.insert(key, Arc::clone(&core_mesh));
             let group = (
@@ -1447,6 +1484,9 @@ fn chunk_is_visible(
     origin_z: i32,
     span: i32,
 ) -> bool {
+    if span <= 0 {
+        return true;
+    }
     let center = Vec3::new(
         origin_x as f32 * CHUNK_SIZE as f32 + CHUNK_SIZE as f32 * span as f32 * 0.5,
         camera_position.y,
@@ -1454,21 +1494,43 @@ fn chunk_is_visible(
     );
     let to_chunk = center - camera_position;
     let distance = (to_chunk.x * to_chunk.x + to_chunk.z * to_chunk.z).sqrt();
+    let chunk_radius = CHUNK_SIZE as f32 * span as f32 * core::f32::consts::SQRT_2 * 0.5 + 2.0;
     let horizontal_forward = Vec3::new(camera_forward.x, 0.0, camera_forward.z).normalized();
-    if distance <= f32::EPSILON || horizontal_forward.length() <= f32::EPSILON {
+    // When the eye is inside the chunk's conservative horizontal bound, some
+    // part of the chunk can surround the camera in every viewing direction.
+    // Applying an angular test here used to cull the player's own chunk when
+    // looking away from its centre, exposing distant terrain through it.
+    if distance <= chunk_radius || horizontal_forward.length() <= f32::EPSILON {
         return true;
     }
 
     let direction = Vec3::new(to_chunk.x / distance, 0.0, to_chunk.z / distance);
-    let chunk_radius = CHUNK_SIZE as f32 * span as f32 * core::f32::consts::SQRT_2 * 0.5 + 2.0;
     let angular_margin = (chunk_radius / distance).clamp(0.0, 1.0).asin();
-    let half_fov = CAMERA_FOV * 0.5 + angular_margin + 0.08;
+    let horizontal_half_fov = ((CAMERA_FOV * 0.5).tan() * REFERENCE_ASPECT).atan();
+    let half_fov = horizontal_half_fov + angular_margin + 0.08;
     direction.dot(horizontal_forward) >= half_fov.min(core::f32::consts::PI).cos()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chunk_containing_the_camera_is_never_angle_culled() {
+        let camera = Vec3::new(0.0, 10.0, 0.0);
+        let away_from_center = Vec3::new(-1.0, 0.0, -1.0).normalized();
+        assert!(chunk_is_visible(camera, away_from_center, 0, 0, 1));
+    }
+
+    #[test]
+    fn chunk_culling_uses_horizontal_not_vertical_fov() {
+        let camera = Vec3::zero();
+        let forward = Vec3::new(0.0, 0.0, -1.0);
+        // About 45 degrees off-axis and far enough that the bound's angular
+        // margin does not mask the old vertical-FOV error.
+        assert!(chunk_is_visible(camera, forward, 9, -11, 1));
+        assert!(!chunk_is_visible(camera, forward, 0, 10, 1));
+    }
 
     #[test]
     fn atlas_v_is_flipped_without_swapping_atlas_rows() {

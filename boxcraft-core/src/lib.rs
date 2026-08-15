@@ -444,6 +444,128 @@ pub struct World {
     block_light: Vec<u8>,
 }
 
+/// Non-occluding voxel space reachable from the world exterior or a viewer.
+///
+/// Far-terrain meshing may omit faces bordering a completely sealed component,
+/// but darkness alone is not enough to prove that a face is hidden. This map
+/// preserves dark tunnels and cave mouths by flood-filling topology instead of
+/// relying on the finite light-propagation distance.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VisibleSpace {
+    width: usize,
+    height: usize,
+    depth: usize,
+    reachable: Vec<u8>,
+}
+
+impl VisibleSpace {
+    /// Flood-fill transparent space from every world boundary and `viewer`.
+    ///
+    /// The returned snapshot remains valid until block topology changes.
+    /// Lighting-only updates do not invalidate it.
+    pub fn from_world(world: &World, viewer: IVec3) -> Self {
+        let mut visible = Self {
+            width: world.width,
+            height: world.height,
+            depth: world.depth,
+            reachable: vec![0; world.blocks.len()],
+        };
+        let mut queue = std::collections::VecDeque::new();
+
+        if world.width > 0 {
+            for y in 0..world.height as i32 {
+                for z in 0..world.depth as i32 {
+                    visible.enqueue(world, &mut queue, IVec3::new(0, y, z));
+                    visible.enqueue(world, &mut queue, IVec3::new(world.width as i32 - 1, y, z));
+                }
+            }
+        }
+        if world.height > 0 {
+            for z in 0..world.depth as i32 {
+                for x in 0..world.width as i32 {
+                    visible.enqueue(world, &mut queue, IVec3::new(x, 0, z));
+                    visible.enqueue(world, &mut queue, IVec3::new(x, world.height as i32 - 1, z));
+                }
+            }
+        }
+        if world.depth > 0 {
+            for y in 0..world.height as i32 {
+                for x in 0..world.width as i32 {
+                    visible.enqueue(world, &mut queue, IVec3::new(x, y, 0));
+                    visible.enqueue(world, &mut queue, IVec3::new(x, y, world.depth as i32 - 1));
+                }
+            }
+        }
+        visible.enqueue(world, &mut queue, viewer);
+
+        while let Some(index) = queue.pop_front() {
+            let position = world.position_of(index);
+            for offset in [
+                IVec3::new(-1, 0, 0),
+                IVec3::new(1, 0, 0),
+                IVec3::new(0, -1, 0),
+                IVec3::new(0, 1, 0),
+                IVec3::new(0, 0, -1),
+                IVec3::new(0, 0, 1),
+            ] {
+                visible.enqueue(world, &mut queue, position + offset);
+            }
+        }
+        visible
+    }
+
+    /// Return whether `position` belongs to reachable transparent space.
+    ///
+    /// Positions outside the finite world are exterior and therefore visible.
+    pub fn reaches(&self, position: IVec3) -> bool {
+        let Some(index) = self.index(position) else {
+            return true;
+        };
+        self.reachable
+            .get(index)
+            .is_some_and(|reachable| *reachable != 0)
+    }
+
+    fn matches(&self, world: &World) -> bool {
+        self.width == world.width
+            && self.height == world.height
+            && self.depth == world.depth
+            && self.reachable.len() == world.blocks.len()
+    }
+
+    fn enqueue(
+        &mut self,
+        world: &World,
+        queue: &mut std::collections::VecDeque<usize>,
+        position: IVec3,
+    ) {
+        let Some(index) = world.index(position) else {
+            return;
+        };
+        if self.reachable[index] != 0 || world.blocks[index].occludes() {
+            return;
+        }
+        self.reachable[index] = 1;
+        queue.push_back(index);
+    }
+
+    fn index(&self, position: IVec3) -> Option<usize> {
+        if position.x < 0
+            || position.y < 0
+            || position.z < 0
+            || position.x >= self.width as i32
+            || position.y >= self.height as i32
+            || position.z >= self.depth as i32
+        {
+            return None;
+        }
+        Some(
+            (position.y as usize * self.depth + position.z as usize) * self.width
+                + position.x as usize,
+        )
+    }
+}
+
 impl World {
     /// Creates an empty world with the requested dimensions.
     ///
@@ -1220,7 +1342,7 @@ pub fn mesh_world(world: &World) -> Mesh {
         world.width as i32 - 1,
         0,
         world.depth as i32 - 1,
-        false,
+        None,
     )
 }
 
@@ -1242,34 +1364,42 @@ pub fn mesh_chunk(world: &World, chunk_x: i32, chunk_z: i32) -> Mesh {
         (chunk_x + 1) * CHUNK_SIZE - 1,
         chunk_z * CHUNK_SIZE,
         (chunk_z + 1) * CHUNK_SIZE - 1,
-        false,
+        None,
     )
 }
 
-/// Builds a distance-reduced chunk mesh for the merged far ring.
+/// Builds an occlusion-safe reduced chunk mesh for the merged far ring.
 ///
-/// Faces whose only exposure is to an unlit enclosed space (deep cave and
-/// interior pockets with zero propagated sky light) are omitted: they can
-/// never be seen from outside, and the near ring restores full detail before
-/// the player can reach them.
+/// Faces bordering a transparent component disconnected from both the world
+/// exterior and the viewer are omitted. Dark but reachable tunnels remain in
+/// the mesh; only topologically sealed space is removed.
 ///
 /// # Arguments
 ///
 /// * `world` - Voxel data containing the chunk.
 /// * `chunk_x` - Chunk coordinate on the x axis in `[CHUNK_SIZE]` units.
 /// * `chunk_z` - Chunk coordinate on the z axis in `[CHUNK_SIZE]` units.
+/// * `visible_space` - Reachability snapshot for the current world topology.
 ///
 /// # Returns
 ///
-/// The chunk mesh without geometry that is only visible from unlit interiors.
-pub fn mesh_chunk_lod(world: &World, chunk_x: i32, chunk_z: i32) -> Mesh {
+/// The chunk mesh without geometry facing topologically sealed space.
+pub fn mesh_chunk_lod(
+    world: &World,
+    chunk_x: i32,
+    chunk_z: i32,
+    visible_space: &VisibleSpace,
+) -> Mesh {
+    // A stale or foreign map must fail open: extra geometry is safe, holes are
+    // not. The frontend normally replaces the snapshot after every edit.
+    let visible_space = visible_space.matches(world).then_some(visible_space);
     mesh_region(
         world,
         chunk_x * CHUNK_SIZE,
         (chunk_x + 1) * CHUNK_SIZE - 1,
         chunk_z * CHUNK_SIZE,
         (chunk_z + 1) * CHUNK_SIZE - 1,
-        true,
+        visible_space,
     )
 }
 
@@ -1279,7 +1409,7 @@ fn mesh_region(
     max_x: i32,
     min_z: i32,
     max_z: i32,
-    skip_dark_interior: bool,
+    visible_space: Option<&VisibleSpace>,
 ) -> Mesh {
     const FACE_UVS: [[f32; 2]; 4] = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
     const FACES: [(IVec3, [Vec3; 4]); 6] = [
@@ -1361,9 +1491,7 @@ fn mesh_region(
                         !neighbor.occludes() && !(block == Block::Water && neighbor == Block::Water)
                     });
                     if face_visible {
-                        if skip_dark_interior
-                            && world.sunlight(neighbor).max(world.block_light(neighbor)) == 0
-                        {
+                        if visible_space.is_some_and(|space| !space.reaches(neighbor)) {
                             continue;
                         }
                         // Still water sits slightly below a full block, the
@@ -2185,8 +2313,8 @@ fn initial_t(origin: f32, direction: f32, step: i32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        Block, IVec3, Mat4, Mesh, Player, PlayerInput, SEA_LEVEL, Vec3, World, mesh_chunk,
-        mesh_chunk_lod, mesh_world, terrain_height,
+        Block, IVec3, Mat4, Mesh, Player, PlayerInput, SEA_LEVEL, Vec3, VisibleSpace, World,
+        mesh_chunk, mesh_chunk_lod, mesh_world, terrain_height,
     };
 
     #[test]
@@ -2590,7 +2718,7 @@ mod tests {
     }
 
     #[test]
-    fn lod_meshing_drops_unlit_interiors_but_keeps_exposed_faces() {
+    fn lod_meshing_drops_sealed_interiors_but_keeps_exposed_faces() {
         let mut world = World::new(8, 8, 8);
         for y in 0..8 {
             for z in 0..8 {
@@ -2611,12 +2739,63 @@ mod tests {
         world.recompute_light();
         assert_eq!(world.sunlight(IVec3::new(4, 4, 4)), 0);
 
+        let visible_space = VisibleSpace::from_world(&world, IVec3::new(0, 0, 0));
         let full = mesh_chunk(&world, 0, 0);
-        let lod = mesh_chunk_lod(&world, 0, 0);
+        let lod = mesh_chunk_lod(&world, 0, 0, &visible_space);
         assert!(lod.vertices.len() < full.vertices.len());
         assert!(!lod.vertices.is_empty());
         // The exposed exterior faces survive the reduction.
         assert!(lod.vertices.iter().any(|vertex| vertex.position.x == 0.0));
+    }
+
+    #[test]
+    fn lod_meshing_keeps_a_dark_tunnel_connected_to_the_exterior() {
+        let mut world = World::new(32, 8, 8);
+        for y in 0..8 {
+            for z in 0..8 {
+                for x in 0..32 {
+                    world.set(IVec3::new(x, y, z), Block::Stone);
+                }
+            }
+        }
+        // This tunnel is open at x=0 but receives no skylight because its
+        // ceiling is solid. A light-level LOD incorrectly deleted its walls.
+        for x in 0..31 {
+            world.set(IVec3::new(x, 3, 3), Block::Air);
+        }
+        world.recompute_light();
+        assert_eq!(world.sunlight(IVec3::new(24, 3, 3)), 0);
+
+        let visible_space = VisibleSpace::from_world(&world, IVec3::new(0, 3, 3));
+        let full = mesh_chunk(&world, 1, 0);
+        let lod = mesh_chunk_lod(&world, 1, 0, &visible_space);
+        assert_eq!(lod.vertices.len(), full.vertices.len());
+        assert_eq!(lod.indices.len(), full.indices.len());
+    }
+
+    #[test]
+    fn lod_meshing_keeps_the_viewers_enclosed_component() {
+        let mut world = World::new(8, 8, 8);
+        for y in 0..8 {
+            for z in 0..8 {
+                for x in 0..8 {
+                    world.set(IVec3::new(x, y, z), Block::Stone);
+                }
+            }
+        }
+        for y in 2..6 {
+            for z in 2..6 {
+                for x in 2..6 {
+                    world.set(IVec3::new(x, y, z), Block::Air);
+                }
+            }
+        }
+
+        let visible_space = VisibleSpace::from_world(&world, IVec3::new(4, 4, 4));
+        let full = mesh_chunk(&world, 0, 0);
+        let lod = mesh_chunk_lod(&world, 0, 0, &visible_space);
+        assert_eq!(lod.vertices.len(), full.vertices.len());
+        assert_eq!(lod.indices.len(), full.indices.len());
     }
 
     #[test]

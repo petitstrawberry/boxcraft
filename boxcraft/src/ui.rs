@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use boxcraft_core::{Block, CHUNK_SIZE, Game, Mat4, PlayerInput, Vec3, mesh_chunk};
+use boxcraft_core::{Block, CHUNK_SIZE, Game, Mat4, PlayerInput, Vec3, mesh_chunk, mesh_chunk_lod};
 use scarlet_ui::prelude::*;
 use scarlet_ui::{
     ApplicationRunExt, ComponentElement, HeaderBar, KeyCode, KeyEvent, MouseButton, PlatformWindow,
@@ -112,8 +112,10 @@ struct BoxcraftApp {
     settings_visible: State<bool>,
     render_distance: State<i32>,
     canvas_frame: State<Arc<SgfxCanvasFrame>>,
+    near_core_meshes: State<Arc<HashMap<(i32, i32), Arc<boxcraft_core::Mesh>>>>,
     near_meshes: State<Arc<HashMap<(i32, i32), Arc<SgfxMesh>>>>,
-    far_mesh: State<Option<Arc<SgfxMesh>>>,
+    far_core_meshes: State<Arc<HashMap<(i32, i32), Arc<boxcraft_core::Mesh>>>>,
+    far_meshes: State<Arc<HashMap<(i32, i32), Arc<SgfxMesh>>>>,
     mesh_revision: State<u64>,
     frame_revision: State<u64>,
     sun_phase: State<f32>,
@@ -125,7 +127,6 @@ struct BoxcraftApp {
     canvas_handle: SgfxCanvasHandle,
     chunk_handles: Arc<Mutex<HashMap<(i32, i32), SgfxMeshHandle>>>,
     handle_pool: Arc<Mutex<Vec<SgfxMeshHandle>>>,
-    far_handle: SgfxMeshHandle,
     block_atlas: Arc<SgfxTexture>,
     runtime: Arc<Mutex<Runtime>>,
 }
@@ -154,11 +155,22 @@ impl BoxcraftApp {
             settings_visible: State::new(StateId::new(22), false),
             render_distance: State::new(StateId::new(23), DEFAULT_RENDER_DISTANCE),
             canvas_frame: State::new(StateId::new(10), initial_frame),
+            near_core_meshes: State::new(
+                StateId::new(25),
+                Arc::new(HashMap::<(i32, i32), Arc<boxcraft_core::Mesh>>::new()),
+            ),
             near_meshes: State::new(
                 StateId::new(11),
                 Arc::new(HashMap::<(i32, i32), Arc<SgfxMesh>>::new()),
             ),
-            far_mesh: State::new(StateId::new(24), None),
+            far_core_meshes: State::new(
+                StateId::new(26),
+                Arc::new(HashMap::<(i32, i32), Arc<boxcraft_core::Mesh>>::new()),
+            ),
+            far_meshes: State::new(
+                StateId::new(24),
+                Arc::new(HashMap::<(i32, i32), Arc<SgfxMesh>>::new()),
+            ),
             mesh_revision: State::new(StateId::new(12), 0),
             frame_revision: State::new(StateId::new(13), 0),
             sun_phase: State::new(StateId::new(20), 0.0),
@@ -173,7 +185,6 @@ impl BoxcraftApp {
             canvas_handle: SgfxCanvasHandle::new(),
             chunk_handles: Arc::new(Mutex::new(HashMap::new())),
             handle_pool: Arc::new(Mutex::new(Vec::new())),
-            far_handle: SgfxMeshHandle::new(),
             block_atlas: block_texture_atlas(),
             runtime: Arc::new(Mutex::new(Runtime::new())),
         };
@@ -245,7 +256,14 @@ impl BoxcraftApp {
             .extend(retired);
         self.near_meshes
             .update(|chunks| *chunks = Arc::new(HashMap::<(i32, i32), Arc<SgfxMesh>>::new()));
-        self.far_mesh.set(None);
+        self.near_core_meshes.set(Arc::new(
+            HashMap::<(i32, i32), Arc<boxcraft_core::Mesh>>::new(),
+        ));
+        self.far_core_meshes.set(Arc::new(
+            HashMap::<(i32, i32), Arc<boxcraft_core::Mesh>>::new(),
+        ));
+        self.far_meshes
+            .set(Arc::new(HashMap::<(i32, i32), Arc<SgfxMesh>>::new()));
         {
             let mut runtime = self
                 .runtime
@@ -446,6 +464,18 @@ impl BoxcraftApp {
             rebuilt |= self.build_near_chunk(chunk.0 + offset.0, chunk.1 + offset.1);
         }
         if rebuilt {
+            // An edit can change visibility, AO, and propagated light across
+            // the far-ring boundary. Invalidate the cached far geometry so it
+            // is rebuilt from the new world state once the near queue settles.
+            self.far_core_meshes.set(Arc::new(
+                HashMap::<(i32, i32), Arc<boxcraft_core::Mesh>>::new(),
+            ));
+            self.far_meshes
+                .set(Arc::new(HashMap::<(i32, i32), Arc<SgfxMesh>>::new()));
+            self.runtime
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .far_dirty = true;
             self.refresh_frame();
         }
     }
@@ -453,10 +483,12 @@ impl BoxcraftApp {
     /// Reconcile the set of resident chunks with the player's render distance.
     ///
     /// Chunks within the near radius keep individual meshes for cheap block
-    /// edits; the remaining ring is merged into one mesh. Mesh handles come
-    /// from a recycled pool because the SGFX renderer's mesh cache never
+    /// edits; the remaining ring keeps one retained mesh per chunk so the
+    /// renderer can cull the part of the ring behind the camera. Mesh handles
+    /// come from a recycled pool because the SGFX renderer's mesh cache never
     /// evicts retired handles.
-    fn refresh_chunk_set(&self) {
+    fn refresh_chunk_set(&self) -> bool {
+        let mut changed = false;
         let player_chunk = self.with_game(|game| {
             let position = game.player.position;
             (
@@ -489,6 +521,14 @@ impl BoxcraftApp {
             .filter(|chunk| !near.contains(chunk))
             .collect();
         if !removed.is_empty() {
+            changed = true;
+            self.near_core_meshes.update(|chunks| {
+                let mut next = (**chunks).clone();
+                for chunk in &removed {
+                    next.remove(chunk);
+                }
+                *chunks = Arc::new(next);
+            });
             self.near_meshes.update(|chunks| {
                 let mut next = (**chunks).clone();
                 for chunk in &removed {
@@ -515,6 +555,35 @@ impl BoxcraftApp {
                 .extend(retired);
         }
 
+        // A chunk can move from the far ring into the near ring while the
+        // rebuild is still deferred. Remove its old far draw immediately so
+        // the same handle is never submitted with two revisions in one frame.
+        let far_set: HashSet<(i32, i32)> = far.iter().copied().collect();
+        let stale_far: Vec<(i32, i32)> = self
+            .far_meshes
+            .get()
+            .keys()
+            .copied()
+            .filter(|chunk| !far_set.contains(chunk))
+            .collect();
+        if !stale_far.is_empty() {
+            changed = true;
+            self.far_core_meshes.update(|meshes| {
+                let mut next = (**meshes).clone();
+                for chunk in &stale_far {
+                    next.remove(chunk);
+                }
+                *meshes = Arc::new(next);
+            });
+            self.far_meshes.update(|meshes| {
+                let mut next = (**meshes).clone();
+                for chunk in &stale_far {
+                    next.remove(chunk);
+                }
+                *meshes = Arc::new(next);
+            });
+        }
+
         let mut runtime = self
             .runtime
             .lock()
@@ -531,6 +600,7 @@ impl BoxcraftApp {
         if runtime.far_chunks != far {
             runtime.far_chunks = far;
             runtime.far_dirty = true;
+            changed = true;
         }
         let mut missing: Vec<(i32, i32)> = desired
             .into_iter()
@@ -549,6 +619,7 @@ impl BoxcraftApp {
             runtime.queued_chunks.insert(chunk);
             runtime.build_queue.push_back(chunk);
         }
+        changed
     }
 
     /// Stream a few queued chunks into GPU meshes; returns whether any moved.
@@ -576,18 +647,18 @@ impl BoxcraftApp {
         built
     }
 
-    /// Merge the far ring into one retained mesh.
+    /// Rebuild the retained far-ring meshes once streaming has settled.
     ///
     /// Deferred until the streaming queue settles so crossing a chunk border
-    /// rebuilds the merged ring once instead of once per incoming chunk.
-    fn rebuild_far_meshes_if_settled(&self) {
+    /// rebuilds the ring once instead of once per incoming chunk.
+    fn rebuild_far_meshes_if_settled(&self) -> bool {
         {
             let mut runtime = self
                 .runtime
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if !runtime.far_dirty || !runtime.build_queue.is_empty() {
-                return;
+                return false;
             }
             runtime.far_dirty = false;
         }
@@ -597,17 +668,78 @@ impl BoxcraftApp {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .far_chunks
             .clone();
-        let mut vertices = Vec::new();
-        for (chunk_x, chunk_z) in far_chunks {
-            let core_mesh = self.with_game(|game| mesh_chunk(&game.world, chunk_x, chunk_z));
-            append_lit_vertices(&core_mesh, self.sun_phase.get(), &mut vertices);
-        }
+        let cached_core_meshes = self.far_core_meshes.get();
+        let mut core_meshes = HashMap::with_capacity(far_chunks.len());
+        let mut meshes = HashMap::with_capacity(far_chunks.len());
         self.mesh_revision
             .update(|revision| *revision = revision.wrapping_add(1));
         let revision = self.mesh_revision.get();
-        let mesh = (!vertices.is_empty())
-            .then(|| SgfxMesh::with_handle(self.far_handle, revision, vertices));
-        self.far_mesh.set(mesh);
+        for (chunk_x, chunk_z) in far_chunks.iter().copied() {
+            let key = (chunk_x, chunk_z);
+            let core_mesh = cached_core_meshes.get(&key).cloned().unwrap_or_else(|| {
+                Arc::new(self.with_game(|game| mesh_chunk_lod(&game.world, chunk_x, chunk_z)))
+            });
+            core_meshes.insert(key, Arc::clone(&core_mesh));
+            let mut vertices = Vec::new();
+            append_lit_vertices(&core_mesh, self.sun_phase.get(), &mut vertices);
+            if vertices.is_empty() {
+                continue;
+            }
+            let handle = {
+                let mut active = self
+                    .chunk_handles
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(handle) = active.get(&key) {
+                    *handle
+                } else {
+                    let handle = self
+                        .handle_pool
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .pop()
+                        .unwrap_or_else(SgfxMeshHandle::new);
+                    active.insert(key, handle);
+                    handle
+                }
+            };
+            meshes.insert(key, SgfxMesh::with_handle(handle, revision, vertices));
+        }
+        self.far_core_meshes.set(Arc::new(core_meshes));
+
+        // Retire handles for chunks that are no longer resident, but retain
+        // handles shared by the near ring so a far-to-near transition can
+        // update the existing renderer buffer safely.
+        let near_chunks = self.near_meshes.get();
+        let stale_handles: Vec<(i32, i32)> = {
+            let handles = self
+                .chunk_handles
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            handles
+                .keys()
+                .copied()
+                .filter(|chunk| !near_chunks.contains_key(chunk) && !meshes.contains_key(chunk))
+                .collect()
+        };
+        if !stale_handles.is_empty() {
+            let retired: Vec<SgfxMeshHandle> = {
+                let mut handles = self
+                    .chunk_handles
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                stale_handles
+                    .iter()
+                    .filter_map(|chunk| handles.remove(chunk))
+                    .collect()
+            };
+            self.handle_pool
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .extend(retired);
+        }
+        self.far_meshes.set(Arc::new(meshes));
+        true
     }
 
     /// Build one chunk's retained SGFX meshes from the live world snapshot.
@@ -616,13 +748,22 @@ impl BoxcraftApp {
     /// light plus ambient occlusion. The frontend maps those into the pixel
     /// atlas and writes one interpolated lighting color per vertex.
     fn build_near_chunk(&self, chunk_x: i32, chunk_z: i32) -> bool {
-        let core_mesh = self.with_game(|game| mesh_chunk(&game.world, chunk_x, chunk_z));
+        let key = (chunk_x, chunk_z);
+        let core_mesh = Arc::new(self.with_game(|game| mesh_chunk(&game.world, chunk_x, chunk_z)));
+        self.near_core_meshes.update(|chunks| {
+            let mut next = (**chunks).clone();
+            next.insert(key, Arc::clone(&core_mesh));
+            *chunks = Arc::new(next);
+        });
+        self.update_near_mesh_from_core(key, &core_mesh)
+    }
+
+    fn update_near_mesh_from_core(&self, key: (i32, i32), core_mesh: &boxcraft_core::Mesh) -> bool {
         let mut vertices = Vec::new();
-        append_lit_vertices(&core_mesh, self.sun_phase.get(), &mut vertices);
+        append_lit_vertices(core_mesh, self.sun_phase.get(), &mut vertices);
         self.mesh_revision
             .update(|revision| *revision = revision.wrapping_add(1));
         let revision = self.mesh_revision.get();
-        let key = (chunk_x, chunk_z);
         let handle = {
             let mut active = self
                 .chunk_handles
@@ -653,24 +794,26 @@ impl BoxcraftApp {
     /// Re-bake the resident vertex colors when the moving sun crosses a
     /// lighting step. The expensive voxel propagation stays unchanged; only
     /// the current sky-channel composition is rebuilt.
-    fn rebuild_lighting_meshes(&self) {
-        let chunks: Vec<(i32, i32)> = self.near_meshes.get().keys().copied().collect();
-        for (chunk_x, chunk_z) in chunks {
-            self.build_near_chunk(chunk_x, chunk_z);
+    fn rebuild_lighting_meshes(&self) -> bool {
+        let mut rebuilt = false;
+        let core_meshes = self.near_core_meshes.get();
+        for (key, core_mesh) in core_meshes.iter() {
+            rebuilt |= self.update_near_mesh_from_core(*key, core_mesh);
         }
         self.runtime
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .far_dirty = true;
-        self.rebuild_far_meshes_if_settled();
+        rebuilt | self.rebuild_far_meshes_if_settled()
     }
 
     fn refresh_frame(&self) {
-        let transform = self.with_game(|game| {
+        let (camera, transform) = self.with_game(|game| {
             let camera = game.player.camera();
-            Mat4::perspective_rh_gl(CAMERA_FOV, REFERENCE_ASPECT, 0.05, 128.0)
+            let transform = Mat4::perspective_rh_gl(CAMERA_FOV, REFERENCE_ASPECT, 0.05, 128.0)
                 .mul_mat4(camera.view_matrix())
-                .columns
+                .columns;
+            (camera, transform)
         });
         self.frame_revision
             .update(|revision| *revision = revision.wrapping_add(1));
@@ -679,15 +822,22 @@ impl BoxcraftApp {
                 .depth_tested()
                 // The SGFX renderer corrects this reference perspective as its canvas resizes.
                 .reference_aspect(REFERENCE_ASPECT);
-        if let Some(mesh) = self.far_mesh.get().filter(|mesh| mesh.triangle_count() > 0) {
+        let far_meshes = self.far_meshes.get();
+        for (_, mesh) in far_meshes.iter().filter(|(chunk, mesh)| {
+            mesh.triangle_count() > 0
+                && chunk_is_visible(camera.position, camera.forward(), **chunk)
+        }) {
             frame = frame.draw(
-                SgfxCanvasDraw::new(Arc::clone(&mesh), transform)
+                SgfxCanvasDraw::new(Arc::clone(mesh), transform)
                     .tint(Color::WHITE)
                     .texture(Arc::clone(&self.block_atlas)),
             );
         }
         let near_meshes = self.near_meshes.get();
-        for meshes in near_meshes.values().filter(|mesh| mesh.triangle_count() > 0) {
+        for (_, meshes) in near_meshes.iter().filter(|(chunk, mesh)| {
+            mesh.triangle_count() > 0
+                && chunk_is_visible(camera.position, camera.forward(), **chunk)
+        }) {
             frame = frame.draw(
                 SgfxCanvasDraw::new(Arc::clone(meshes), transform)
                     .tint(Color::WHITE)
@@ -929,6 +1079,7 @@ impl Application for BoxcraftApp {
         };
 
         let input = self.keys.get().player_input();
+        let previous_camera = self.with_game(|game| game.player.camera());
         self.with_game(|game| {
             game.player.step(&game.world, input, delta_seconds);
             if game.player.position.y < -4.0 {
@@ -937,20 +1088,24 @@ impl Application for BoxcraftApp {
                 game.player.grounded = false;
             }
         });
+        let camera_changed = self.with_game(|game| game.player.camera()) != previous_camera;
+        let mut frame_changed = camera_changed;
         if let Some(sun_phase) = sun_phase {
             self.sun_phase.set(sun_phase);
-            self.rebuild_lighting_meshes();
+            frame_changed |= self.rebuild_lighting_meshes();
         }
         // Stream terrain chunks around the player and drop distant ones.
-        self.refresh_chunk_set();
-        self.process_build_queue(CHUNKS_PER_FRAME);
-        self.rebuild_far_meshes_if_settled();
+        frame_changed |= self.refresh_chunk_set();
+        frame_changed |= self.process_build_queue(CHUNKS_PER_FRAME);
+        frame_changed |= self.rebuild_far_meshes_if_settled();
         if let Some(fps) = fps {
             self.fps.set(fps);
             self.fps_text.set(format!("FPS: {fps}"));
             self.update_hud();
         }
-        self.refresh_frame();
+        if frame_changed {
+            self.refresh_frame();
+        }
     }
 
     fn scenes(&self) -> impl Scene {
@@ -1268,6 +1423,31 @@ fn block_name(block: Block) -> &'static str {
         Block::Snow => "Snow",
         Block::Torch => "Torch",
     }
+}
+
+/// Return whether a horizontal chunk can intersect the camera's view cone.
+///
+/// This is intentionally conservative: the chunk's diagonal plus a small
+/// margin is treated as a circle, so a face at the edge of the viewport is not
+/// clipped just because its chunk centre is outside the exact FOV.
+fn chunk_is_visible(camera_position: Vec3, camera_forward: Vec3, chunk: (i32, i32)) -> bool {
+    let center = Vec3::new(
+        chunk.0 as f32 * CHUNK_SIZE as f32 + CHUNK_SIZE as f32 * 0.5,
+        camera_position.y,
+        chunk.1 as f32 * CHUNK_SIZE as f32 + CHUNK_SIZE as f32 * 0.5,
+    );
+    let to_chunk = center - camera_position;
+    let distance = (to_chunk.x * to_chunk.x + to_chunk.z * to_chunk.z).sqrt();
+    let horizontal_forward = Vec3::new(camera_forward.x, 0.0, camera_forward.z).normalized();
+    if distance <= f32::EPSILON || horizontal_forward.length() <= f32::EPSILON {
+        return true;
+    }
+
+    let direction = Vec3::new(to_chunk.x / distance, 0.0, to_chunk.z / distance);
+    let chunk_radius = CHUNK_SIZE as f32 * core::f32::consts::SQRT_2 * 0.5 + 2.0;
+    let angular_margin = (chunk_radius / distance).clamp(0.0, 1.0).asin();
+    let half_fov = CAMERA_FOV * 0.5 + angular_margin + 0.08;
+    direction.dot(horizontal_forward) >= half_fov.min(core::f32::consts::PI).cos()
 }
 
 #[cfg(test)]

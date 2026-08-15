@@ -33,6 +33,12 @@ const CHUNKS_PER_FRAME: usize = 3;
 const DEFAULT_RENDER_DISTANCE: i32 = 3;
 const MIN_RENDER_DISTANCE: i32 = 1;
 const MAX_RENDER_DISTANCE: i32 = 6;
+/// Chunks within this Chebyshev radius keep individual per-bucket meshes.
+///
+/// The SGFX canvas frame is capped at 240 draws and 256 retained meshes, so
+/// the near ring stays at 5×5 chunks × 8 light buckets = 200 draws and the
+/// remaining ring is merged into one mesh per bucket (8 more draws).
+const NEAR_CHUNK_RADIUS: i32 = 2;
 
 /// Run the Boxcraft application.
 ///
@@ -74,6 +80,8 @@ struct Runtime {
     build_queue: VecDeque<(i32, i32)>,
     queued_chunks: HashSet<(i32, i32)>,
     player_chunk: (i32, i32),
+    far_dirty: bool,
+    far_chunks: Vec<(i32, i32)>,
 }
 
 impl Runtime {
@@ -88,12 +96,16 @@ impl Runtime {
             build_queue: VecDeque::new(),
             queued_chunks: HashSet::new(),
             player_chunk: (i32::MAX, i32::MAX),
+            far_dirty: false,
+            far_chunks: Vec::new(),
         }
     }
 }
 
 /// The per-bucket GPU meshes of one streamed terrain chunk.
 type ChunkMeshes = [Option<Arc<SgfxMesh>>; TERRAIN_LIGHT_BUCKETS];
+/// Stable per-bucket mesh identities, recycled through a fixed pool.
+type ChunkHandles = [SgfxMeshHandle; TERRAIN_LIGHT_BUCKETS];
 
 #[derive(Clone)]
 struct BoxcraftApp {
@@ -110,7 +122,8 @@ struct BoxcraftApp {
     settings_visible: State<bool>,
     render_distance: State<i32>,
     canvas_frame: State<Arc<SgfxCanvasFrame>>,
-    chunk_meshes: State<Arc<HashMap<(i32, i32), Arc<ChunkMeshes>>>>,
+    near_meshes: State<Arc<HashMap<(i32, i32), Arc<ChunkMeshes>>>>,
+    far_meshes: State<Arc<ChunkMeshes>>,
     mesh_revision: State<u64>,
     frame_revision: State<u64>,
     sun_phase: State<f32>,
@@ -120,7 +133,9 @@ struct BoxcraftApp {
     selected_block: State<String>,
     status: State<String>,
     canvas_handle: SgfxCanvasHandle,
-    chunk_handles: Arc<Mutex<HashMap<(i32, i32), [SgfxMeshHandle; TERRAIN_LIGHT_BUCKETS]>>>,
+    chunk_handles: Arc<Mutex<HashMap<(i32, i32), ChunkHandles>>>,
+    handle_pool: Arc<Mutex<Vec<ChunkHandles>>>,
+    far_handles: ChunkHandles,
     block_atlas: Arc<SgfxTexture>,
     runtime: Arc<Mutex<Runtime>>,
 }
@@ -149,10 +164,11 @@ impl BoxcraftApp {
             settings_visible: State::new(StateId::new(22), false),
             render_distance: State::new(StateId::new(23), DEFAULT_RENDER_DISTANCE),
             canvas_frame: State::new(StateId::new(10), initial_frame),
-            chunk_meshes: State::new(
+            near_meshes: State::new(
                 StateId::new(11),
                 Arc::new(HashMap::<(i32, i32), Arc<ChunkMeshes>>::new()),
             ),
+            far_meshes: State::new(StateId::new(24), Arc::new(ChunkMeshes::default())),
             mesh_revision: State::new(StateId::new(12), 0),
             frame_revision: State::new(StateId::new(13), 0),
             sun_phase: State::new(StateId::new(20), 0.0),
@@ -166,6 +182,8 @@ impl BoxcraftApp {
             ),
             canvas_handle: SgfxCanvasHandle::new(),
             chunk_handles: Arc::new(Mutex::new(HashMap::new())),
+            handle_pool: Arc::new(Mutex::new(Vec::new())),
+            far_handles: std::array::from_fn(|_| SgfxMeshHandle::new()),
             block_atlas: block_texture_atlas(),
             runtime: Arc::new(Mutex::new(Runtime::new())),
         };
@@ -224,12 +242,21 @@ impl BoxcraftApp {
         let seed = self.seed.get();
         self.game.set(Arc::new(Mutex::new(Game::generated(seed))));
         self.clear_pressed_keys();
-        self.chunk_meshes
-            .update(|chunks| *chunks = Arc::new(HashMap::<(i32, i32), Arc<ChunkMeshes>>::new()));
-        self.chunk_handles
+        let retired: Vec<ChunkHandles> = {
+            let mut handles = self
+                .chunk_handles
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            handles.drain().map(|(_, handles)| handles).collect()
+        };
+        self.handle_pool
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear();
+            .extend(retired);
+        self.near_meshes
+            .update(|chunks| *chunks = Arc::new(HashMap::<(i32, i32), Arc<ChunkMeshes>>::new()));
+        self.far_meshes
+            .update(|meshes| *meshes = Arc::new(std::array::from_fn(|_| None)));
         {
             let mut runtime = self
                 .runtime
@@ -238,6 +265,8 @@ impl BoxcraftApp {
             runtime.build_queue.clear();
             runtime.queued_chunks.clear();
             runtime.player_chunk = (i32::MAX, i32::MAX);
+            runtime.far_dirty = false;
+            runtime.far_chunks.clear();
         }
         self.refresh_chunk_set();
         self.update_hud();
@@ -421,7 +450,7 @@ impl BoxcraftApp {
             offsets.extend([(0, 1)]);
         }
         for offset in offsets {
-            rebuilt |= self.build_chunk(chunk.0 + offset.0, chunk.1 + offset.1);
+            rebuilt |= self.build_near_chunk(chunk.0 + offset.0, chunk.1 + offset.1);
         }
         if rebuilt {
             self.refresh_frame();
@@ -430,8 +459,10 @@ impl BoxcraftApp {
 
     /// Reconcile the set of resident chunks with the player's render distance.
     ///
-    /// Chunks entering the range are queued for streaming build; chunks that
-    /// left it are dropped together with their GPU meshes.
+    /// Chunks within the near radius keep individual meshes for cheap block
+    /// edits; the remaining ring is merged into one mesh per light bucket.
+    /// Mesh handles come from a recycled pool because the SGFX renderer's
+    /// mesh cache never evicts retired handles.
     fn refresh_chunk_set(&self) {
         let player_chunk = self.with_game(|game| {
             let position = game.player.position;
@@ -441,30 +472,53 @@ impl BoxcraftApp {
             )
         });
         let distance = self.render_distance.get();
+        let near_radius = distance.min(NEAR_CHUNK_RADIUS);
         let desired: HashSet<(i32, i32)> = (-distance..=distance)
             .flat_map(|dz| (-distance..=distance).map(move |dx| (dx, dz)))
             .map(|(dx, dz)| (player_chunk.0 + dx, player_chunk.1 + dz))
             .collect();
+        let near: HashSet<(i32, i32)> = (-near_radius..=near_radius)
+            .flat_map(|dz| (-near_radius..=near_radius).map(move |dx| (dx, dz)))
+            .map(|(dx, dz)| (player_chunk.0 + dx, player_chunk.1 + dz))
+            .collect();
+        let far: Vec<(i32, i32)> = desired
+            .iter()
+            .copied()
+            .filter(|chunk| !near.contains(chunk))
+            .collect();
 
         let removed: Vec<(i32, i32)> = self
-            .chunk_meshes
+            .near_meshes
             .get()
             .keys()
             .copied()
-            .filter(|chunk| !desired.contains(chunk))
+            .filter(|chunk| !near.contains(chunk))
             .collect();
         if !removed.is_empty() {
-            self.chunk_meshes.update(|chunks| {
+            self.near_meshes.update(|chunks| {
                 let mut next = (**chunks).clone();
                 for chunk in &removed {
                     next.remove(chunk);
                 }
                 *chunks = Arc::new(next);
             });
-            self.chunk_handles
+            // Return retired handle arrays to the pool instead of dropping
+            // them: the renderer caches by handle and never evicts, so fresh
+            // handles for every streamed chunk would grow the cache unbounded.
+            let retired: Vec<ChunkHandles> = {
+                let mut handles = self
+                    .chunk_handles
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                removed
+                    .iter()
+                    .filter_map(|chunk| handles.remove(chunk))
+                    .collect()
+            };
+            self.handle_pool
                 .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .retain(|chunk, _| desired.contains(chunk));
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .extend(retired);
         }
 
         let mut runtime = self
@@ -480,10 +534,20 @@ impl BoxcraftApp {
             runtime.build_queue.retain(|chunk| queued.contains(chunk));
         }
         runtime.player_chunk = player_chunk;
+        if runtime.far_chunks != far {
+            runtime.far_chunks = far;
+            runtime.far_dirty = true;
+        }
         let mut missing: Vec<(i32, i32)> = desired
             .into_iter()
             .filter(|chunk| {
-                !self.chunk_meshes.get().contains_key(chunk)
+                // Far chunks only need queueing while their merged mesh is
+                // stale; otherwise they would be re-queued every idle because
+                // they never enter the near-mesh map.
+                let is_near = near.contains(chunk);
+                let far_needs_merge = !is_near && runtime.far_dirty;
+                !self.near_meshes.get().contains_key(chunk)
+                    && (is_near || far_needs_merge)
                     && !runtime.queued_chunks.contains(chunk)
             })
             .collect();
@@ -518,9 +582,65 @@ impl BoxcraftApp {
                 }
             };
             let Some(chunk) = next else { break };
-            built |= self.build_chunk(chunk.0, chunk.1);
+            let is_near = {
+                let runtime = self
+                    .runtime
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                !runtime.far_chunks.contains(&chunk)
+            };
+            if is_near {
+                built |= self.build_near_chunk(chunk.0, chunk.1);
+            } else {
+                // Far ring geometry is rebuilt as one merged mesh once the
+                // streaming queue settles; individual meshes are unnecessary.
+                self.runtime
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .far_dirty = true;
+            }
         }
         built
+    }
+
+    /// Merge the far ring into one retained mesh per light bucket.
+    ///
+    /// Deferred until the streaming queue settles so crossing a chunk border
+    /// rebuilds the merged ring once instead of once per incoming chunk.
+    fn rebuild_far_meshes_if_settled(&self) {
+        {
+            let mut runtime = self
+                .runtime
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !runtime.far_dirty || !runtime.build_queue.is_empty() {
+                return;
+            }
+            runtime.far_dirty = false;
+        }
+        let far_chunks: Vec<(i32, i32)> = self
+            .runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .far_chunks
+            .clone();
+        let mut bucket_vertices: [Vec<SgfxCanvasVertex>; TERRAIN_LIGHT_BUCKETS] =
+            std::array::from_fn(|_| Vec::new());
+        for (chunk_x, chunk_z) in far_chunks {
+            let core_mesh = self.with_game(|game| mesh_chunk(&game.world, chunk_x, chunk_z));
+            append_bucket_vertices(&core_mesh, &mut bucket_vertices);
+        }
+        self.mesh_revision
+            .update(|revision| *revision = revision.wrapping_add(1));
+        let revision = self.mesh_revision.get();
+        let handles = self.far_handles;
+        let meshes = std::array::from_fn(|bucket| {
+            let vertices = core::mem::take(&mut bucket_vertices[bucket]);
+            (!vertices.is_empty())
+                .then(|| SgfxMesh::with_handle(handles[bucket], revision, vertices))
+        });
+        self.far_meshes
+            .update(|current| *current = Arc::new(meshes));
     }
 
     /// Build one chunk's retained SGFX meshes from the live world snapshot.
@@ -530,62 +650,44 @@ impl BoxcraftApp {
     /// then groups complete triangles by static illumination. Textured SGFX
     /// draws use each group's uniform tint because that pipeline does not
     /// consume per-vertex colors; the moving sun lives in the tint alone.
-    fn build_chunk(&self, chunk_x: i32, chunk_z: i32) -> bool {
+    fn build_near_chunk(&self, chunk_x: i32, chunk_z: i32) -> bool {
         let core_mesh = self.with_game(|game| mesh_chunk(&game.world, chunk_x, chunk_z));
         if core_mesh.vertices.is_empty() {
             return false;
         }
         let mut bucket_vertices: [Vec<SgfxCanvasVertex>; TERRAIN_LIGHT_BUCKETS] =
             std::array::from_fn(|_| Vec::new());
-
-        for triangle in core_mesh.indices.chunks_exact(3) {
-            let [first, second, third] = triangle else {
-                continue;
-            };
-            let (Some(first), Some(second), Some(third)) = (
-                core_mesh.vertices.get(*first as usize),
-                core_mesh.vertices.get(*second as usize),
-                core_mesh.vertices.get(*third as usize),
-            ) else {
-                continue;
-            };
-            let bucket = terrain_triangle_light_bucket([first, second, third]);
-            let vertices = &mut bucket_vertices[bucket];
-            for vertex in [first, second, third] {
-                vertices.push(
-                    // Textured SGFX currently ignores vertex color. Keep this
-                    // neutral so the bucket draw tint remains the single
-                    // source of textured terrain illumination.
-                    SgfxCanvasVertex::new(
-                        [vertex.position.x, vertex.position.y, vertex.position.z, 1.0],
-                        [1.0, 1.0, 1.0, 1.0],
-                    )
-                    .with_tex_coord(atlas_tex_coord(
-                        vertex.block,
-                        vertex.normal,
-                        vertex.atlas_uv,
-                    )),
-                );
-            }
-        }
+        append_bucket_vertices(&core_mesh, &mut bucket_vertices);
         self.mesh_revision
             .update(|revision| *revision = revision.wrapping_add(1));
         let revision = self.mesh_revision.get();
-        let handles = self
-            .chunk_handles
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .entry((chunk_x, chunk_z))
-            .or_insert_with(|| std::array::from_fn(|_| SgfxMeshHandle::new()))
-            .clone();
+        let key = (chunk_x, chunk_z);
+        let handles = {
+            let mut active = self
+                .chunk_handles
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(handles) = active.get(&key) {
+                *handles
+            } else {
+                let handles = self
+                    .handle_pool
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .pop()
+                    .unwrap_or_else(|| std::array::from_fn(|_| SgfxMeshHandle::new()));
+                active.insert(key, handles);
+                handles
+            }
+        };
         let meshes = std::array::from_fn(|bucket| {
             let vertices = core::mem::take(&mut bucket_vertices[bucket]);
             (!vertices.is_empty())
                 .then(|| SgfxMesh::with_handle(handles[bucket], revision, vertices))
         });
-        self.chunk_meshes.update(|chunks| {
+        self.near_meshes.update(|chunks| {
             let mut next = (**chunks).clone();
-            next.insert((chunk_x, chunk_z), Arc::new(meshes));
+            next.insert(key, Arc::new(meshes));
             *chunks = Arc::new(next);
         });
         true
@@ -605,9 +707,19 @@ impl BoxcraftApp {
                 .depth_tested()
                 // The SGFX renderer corrects this reference perspective as its canvas resizes.
                 .reference_aspect(REFERENCE_ASPECT);
-        let chunk_meshes = self.chunk_meshes.get();
+        let far_meshes = self.far_meshes.get();
         let sun_phase = self.sun_phase.get();
-        for meshes in chunk_meshes.values() {
+        for (bucket, mesh) in far_meshes.iter().enumerate() {
+            if let Some(mesh) = mesh {
+                frame = frame.draw(
+                    SgfxCanvasDraw::new(Arc::clone(mesh), transform)
+                        .tint(terrain_bucket_tint(bucket, sun_phase))
+                        .texture(Arc::clone(&self.block_atlas)),
+                );
+            }
+        }
+        let near_meshes = self.near_meshes.get();
+        for meshes in near_meshes.values() {
             for (bucket, mesh) in meshes.iter().enumerate() {
                 if let Some(mesh) = mesh {
                     frame = frame.draw(
@@ -867,6 +979,7 @@ impl Application for BoxcraftApp {
         // Stream terrain chunks around the player and drop distant ones.
         self.refresh_chunk_set();
         self.process_build_queue(CHUNKS_PER_FRAME);
+        self.rebuild_far_meshes_if_settled();
         if let Some(fps) = fps {
             self.fps.set(fps);
             self.fps_text.set(format!("FPS: {fps}"));
@@ -890,6 +1003,44 @@ impl Application for BoxcraftApp {
 
 fn build_boxcraft_content(app: &BoxcraftApp) -> Box<dyn View> {
     Box::new(app.content())
+}
+
+/// Convert one terrain chunk into per-bucket canvas vertices.
+///
+/// Textured SGFX ignores vertex color, so illumination lives in the bucket
+/// draw tint: triangles are grouped by their baked sky-light and ambient
+/// occlusion so each group can be tinted uniformly.
+fn append_bucket_vertices(
+    core_mesh: &boxcraft_core::Mesh,
+    bucket_vertices: &mut [Vec<SgfxCanvasVertex>; TERRAIN_LIGHT_BUCKETS],
+) {
+    for triangle in core_mesh.indices.chunks_exact(3) {
+        let [first, second, third] = triangle else {
+            continue;
+        };
+        let (Some(first), Some(second), Some(third)) = (
+            core_mesh.vertices.get(*first as usize),
+            core_mesh.vertices.get(*second as usize),
+            core_mesh.vertices.get(*third as usize),
+        ) else {
+            continue;
+        };
+        let bucket = terrain_triangle_light_bucket([first, second, third]);
+        let vertices = &mut bucket_vertices[bucket];
+        for vertex in [first, second, third] {
+            vertices.push(
+                SgfxCanvasVertex::new(
+                    [vertex.position.x, vertex.position.y, vertex.position.z, 1.0],
+                    [1.0, 1.0, 1.0, 1.0],
+                )
+                .with_tex_coord(atlas_tex_coord(
+                    vertex.block,
+                    vertex.normal,
+                    vertex.atlas_uv,
+                )),
+            );
+        }
+    }
 }
 
 /// Create the compact RGBA8 atlas used by every visible terrain block.

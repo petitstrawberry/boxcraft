@@ -25,24 +25,14 @@ const ATLAS_COLUMNS: u32 = 4;
 const ATLAS_ROWS: u32 = 4;
 const DAY_LENGTH_SECONDS: f32 = 150.0;
 const SUNLIGHT_UPDATES_PER_SECOND: f32 = 4.0;
-/// Light buckets: sky classes crossed with torch-light classes.
-///
-/// The SGFX canvas frame caps at 240 draws. The near ring is 5×5 chunks, so
-/// 9 buckets keep terrain at 25×9 + 9 = 234 draws for any render distance.
-const SKY_LIGHT_BUCKETS: usize = 3;
-const TORCH_LIGHT_BUCKETS: usize = 3;
-const TERRAIN_LIGHT_BUCKETS: usize = SKY_LIGHT_BUCKETS * TORCH_LIGHT_BUCKETS;
 /// Terrain chunks built per idle tick while streaming the world in.
 const CHUNKS_PER_FRAME: usize = 3;
 /// Default and inclusive bounds for the configurable render distance.
 const DEFAULT_RENDER_DISTANCE: i32 = 3;
 const MIN_RENDER_DISTANCE: i32 = 1;
 const MAX_RENDER_DISTANCE: i32 = 6;
-/// Chunks within this Chebyshev radius keep individual per-bucket meshes.
-///
-/// The SGFX canvas frame is capped at 240 draws and 256 retained meshes, so
-/// the near ring stays at 5×5 chunks × 8 light buckets = 200 draws and the
-/// remaining ring is merged into one mesh per bucket (8 more draws).
+/// Chunks within this Chebyshev radius keep individual meshes for edits. Each
+/// chunk now has one textured draw; illumination is carried by its vertices.
 const NEAR_CHUNK_RADIUS: i32 = 2;
 
 /// Run the Boxcraft application.
@@ -107,11 +97,6 @@ impl Runtime {
     }
 }
 
-/// The per-bucket GPU meshes of one streamed terrain chunk.
-type ChunkMeshes = [Option<Arc<SgfxMesh>>; TERRAIN_LIGHT_BUCKETS];
-/// Stable per-bucket mesh identities, recycled through a fixed pool.
-type ChunkHandles = [SgfxMeshHandle; TERRAIN_LIGHT_BUCKETS];
-
 #[derive(Clone)]
 struct BoxcraftApp {
     game: State<Arc<Mutex<Game>>>,
@@ -127,8 +112,8 @@ struct BoxcraftApp {
     settings_visible: State<bool>,
     render_distance: State<i32>,
     canvas_frame: State<Arc<SgfxCanvasFrame>>,
-    near_meshes: State<Arc<HashMap<(i32, i32), Arc<ChunkMeshes>>>>,
-    far_meshes: State<Arc<ChunkMeshes>>,
+    near_meshes: State<Arc<HashMap<(i32, i32), Arc<SgfxMesh>>>>,
+    far_mesh: State<Option<Arc<SgfxMesh>>>,
     mesh_revision: State<u64>,
     frame_revision: State<u64>,
     sun_phase: State<f32>,
@@ -138,9 +123,9 @@ struct BoxcraftApp {
     selected_block: State<String>,
     status: State<String>,
     canvas_handle: SgfxCanvasHandle,
-    chunk_handles: Arc<Mutex<HashMap<(i32, i32), ChunkHandles>>>,
-    handle_pool: Arc<Mutex<Vec<ChunkHandles>>>,
-    far_handles: ChunkHandles,
+    chunk_handles: Arc<Mutex<HashMap<(i32, i32), SgfxMeshHandle>>>,
+    handle_pool: Arc<Mutex<Vec<SgfxMeshHandle>>>,
+    far_handle: SgfxMeshHandle,
     block_atlas: Arc<SgfxTexture>,
     runtime: Arc<Mutex<Runtime>>,
 }
@@ -171,9 +156,9 @@ impl BoxcraftApp {
             canvas_frame: State::new(StateId::new(10), initial_frame),
             near_meshes: State::new(
                 StateId::new(11),
-                Arc::new(HashMap::<(i32, i32), Arc<ChunkMeshes>>::new()),
+                Arc::new(HashMap::<(i32, i32), Arc<SgfxMesh>>::new()),
             ),
-            far_meshes: State::new(StateId::new(24), Arc::new(ChunkMeshes::default())),
+            far_mesh: State::new(StateId::new(24), None),
             mesh_revision: State::new(StateId::new(12), 0),
             frame_revision: State::new(StateId::new(13), 0),
             sun_phase: State::new(StateId::new(20), 0.0),
@@ -188,7 +173,7 @@ impl BoxcraftApp {
             canvas_handle: SgfxCanvasHandle::new(),
             chunk_handles: Arc::new(Mutex::new(HashMap::new())),
             handle_pool: Arc::new(Mutex::new(Vec::new())),
-            far_handles: std::array::from_fn(|_| SgfxMeshHandle::new()),
+            far_handle: SgfxMeshHandle::new(),
             block_atlas: block_texture_atlas(),
             runtime: Arc::new(Mutex::new(Runtime::new())),
         };
@@ -247,7 +232,7 @@ impl BoxcraftApp {
         let seed = self.seed.get();
         self.game.set(Arc::new(Mutex::new(Game::generated(seed))));
         self.clear_pressed_keys();
-        let retired: Vec<ChunkHandles> = {
+        let retired: Vec<SgfxMeshHandle> = {
             let mut handles = self
                 .chunk_handles
                 .lock()
@@ -259,9 +244,8 @@ impl BoxcraftApp {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .extend(retired);
         self.near_meshes
-            .update(|chunks| *chunks = Arc::new(HashMap::<(i32, i32), Arc<ChunkMeshes>>::new()));
-        self.far_meshes
-            .update(|meshes| *meshes = Arc::new(std::array::from_fn(|_| None)));
+            .update(|chunks| *chunks = Arc::new(HashMap::<(i32, i32), Arc<SgfxMesh>>::new()));
+        self.far_mesh.set(None);
         {
             let mut runtime = self
                 .runtime
@@ -469,9 +453,9 @@ impl BoxcraftApp {
     /// Reconcile the set of resident chunks with the player's render distance.
     ///
     /// Chunks within the near radius keep individual meshes for cheap block
-    /// edits; the remaining ring is merged into one mesh per light bucket.
-    /// Mesh handles come from a recycled pool because the SGFX renderer's
-    /// mesh cache never evicts retired handles.
+    /// edits; the remaining ring is merged into one mesh. Mesh handles come
+    /// from a recycled pool because the SGFX renderer's mesh cache never
+    /// evicts retired handles.
     fn refresh_chunk_set(&self) {
         let player_chunk = self.with_game(|game| {
             let position = game.player.position;
@@ -490,11 +474,12 @@ impl BoxcraftApp {
             .flat_map(|dz| (-near_radius..=near_radius).map(move |dx| (dx, dz)))
             .map(|(dx, dz)| (player_chunk.0 + dx, player_chunk.1 + dz))
             .collect();
-        let far: Vec<(i32, i32)> = desired
+        let mut far: Vec<(i32, i32)> = desired
             .iter()
             .copied()
             .filter(|chunk| !near.contains(chunk))
             .collect();
+        far.sort_unstable();
 
         let removed: Vec<(i32, i32)> = self
             .near_meshes
@@ -511,10 +496,10 @@ impl BoxcraftApp {
                 }
                 *chunks = Arc::new(next);
             });
-            // Return retired handle arrays to the pool instead of dropping
+            // Return retired handles to the pool instead of dropping
             // them: the renderer caches by handle and never evicts, so fresh
             // handles for every streamed chunk would grow the cache unbounded.
-            let retired: Vec<ChunkHandles> = {
+            let retired: Vec<SgfxMeshHandle> = {
                 let mut handles = self
                     .chunk_handles
                     .lock()
@@ -550,13 +535,8 @@ impl BoxcraftApp {
         let mut missing: Vec<(i32, i32)> = desired
             .into_iter()
             .filter(|chunk| {
-                // Far chunks only need queueing while their merged mesh is
-                // stale; otherwise they would be re-queued every idle because
-                // they never enter the near-mesh map.
-                let is_near = near.contains(chunk);
-                let far_needs_merge = !is_near && runtime.far_dirty;
-                !self.near_meshes.get().contains_key(chunk)
-                    && (is_near || far_needs_merge)
+                near.contains(chunk)
+                    && !self.near_meshes.get().contains_key(chunk)
                     && !runtime.queued_chunks.contains(chunk)
             })
             .collect();
@@ -591,28 +571,12 @@ impl BoxcraftApp {
                 }
             };
             let Some(chunk) = next else { break };
-            let is_near = {
-                let runtime = self
-                    .runtime
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                !runtime.far_chunks.contains(&chunk)
-            };
-            if is_near {
-                built |= self.build_near_chunk(chunk.0, chunk.1);
-            } else {
-                // Far ring geometry is rebuilt as one merged mesh once the
-                // streaming queue settles; individual meshes are unnecessary.
-                self.runtime
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .far_dirty = true;
-            }
+            built |= self.build_near_chunk(chunk.0, chunk.1);
         }
         built
     }
 
-    /// Merge the far ring into one retained mesh per light bucket.
+    /// Merge the far ring into one retained mesh.
     ///
     /// Deferred until the streaming queue settles so crossing a chunk border
     /// rebuilds the merged ring once instead of once per incoming chunk.
@@ -633,73 +597,72 @@ impl BoxcraftApp {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .far_chunks
             .clone();
-        let mut bucket_vertices: [Vec<SgfxCanvasVertex>; TERRAIN_LIGHT_BUCKETS] =
-            std::array::from_fn(|_| Vec::new());
+        let mut vertices = Vec::new();
         for (chunk_x, chunk_z) in far_chunks {
             let core_mesh = self.with_game(|game| mesh_chunk(&game.world, chunk_x, chunk_z));
-            append_bucket_vertices(&core_mesh, &mut bucket_vertices);
+            append_lit_vertices(&core_mesh, self.sun_phase.get(), &mut vertices);
         }
         self.mesh_revision
             .update(|revision| *revision = revision.wrapping_add(1));
         let revision = self.mesh_revision.get();
-        let handles = self.far_handles;
-        let meshes = std::array::from_fn(|bucket| {
-            let vertices = core::mem::take(&mut bucket_vertices[bucket]);
-            (!vertices.is_empty())
-                .then(|| SgfxMesh::with_handle(handles[bucket], revision, vertices))
-        });
-        self.far_meshes
-            .update(|current| *current = Arc::new(meshes));
+        let mesh = (!vertices.is_empty())
+            .then(|| SgfxMesh::with_handle(self.far_handle, revision, vertices));
+        self.far_mesh.set(mesh);
     }
 
     /// Build one chunk's retained SGFX meshes from the live world snapshot.
     ///
-    /// Terrain supplies local UVs, material identity, and baked sky-light and
-    /// ambient-occlusion values. The frontend maps those into the pixel atlas,
-    /// then groups complete triangles by static illumination. Textured SGFX
-    /// draws use each group's uniform tint because that pipeline does not
-    /// consume per-vertex colors; the moving sun lives in the tint alone.
+    /// Terrain supplies local UVs, material identity, and baked sky/block
+    /// light plus ambient occlusion. The frontend maps those into the pixel
+    /// atlas and writes one interpolated lighting color per vertex.
     fn build_near_chunk(&self, chunk_x: i32, chunk_z: i32) -> bool {
         let core_mesh = self.with_game(|game| mesh_chunk(&game.world, chunk_x, chunk_z));
-        if core_mesh.vertices.is_empty() {
-            return false;
-        }
-        let mut bucket_vertices: [Vec<SgfxCanvasVertex>; TERRAIN_LIGHT_BUCKETS] =
-            std::array::from_fn(|_| Vec::new());
-        append_bucket_vertices(&core_mesh, &mut bucket_vertices);
+        let mut vertices = Vec::new();
+        append_lit_vertices(&core_mesh, self.sun_phase.get(), &mut vertices);
         self.mesh_revision
             .update(|revision| *revision = revision.wrapping_add(1));
         let revision = self.mesh_revision.get();
         let key = (chunk_x, chunk_z);
-        let handles = {
+        let handle = {
             let mut active = self
                 .chunk_handles
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Some(handles) = active.get(&key) {
-                *handles
+            if let Some(handle) = active.get(&key) {
+                *handle
             } else {
-                let handles = self
+                let handle = self
                     .handle_pool
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .pop()
-                    .unwrap_or_else(|| std::array::from_fn(|_| SgfxMeshHandle::new()));
-                active.insert(key, handles);
-                handles
+                    .unwrap_or_else(SgfxMeshHandle::new);
+                active.insert(key, handle);
+                handle
             }
         };
-        let meshes = std::array::from_fn(|bucket| {
-            let vertices = core::mem::take(&mut bucket_vertices[bucket]);
-            (!vertices.is_empty())
-                .then(|| SgfxMesh::with_handle(handles[bucket], revision, vertices))
-        });
+        let mesh = SgfxMesh::with_handle(handle, revision, vertices);
         self.near_meshes.update(|chunks| {
             let mut next = (**chunks).clone();
-            next.insert(key, Arc::new(meshes));
+            next.insert(key, mesh);
             *chunks = Arc::new(next);
         });
         true
+    }
+
+    /// Re-bake the resident vertex colors when the moving sun crosses a
+    /// lighting step. The expensive voxel propagation stays unchanged; only
+    /// the current sky-channel composition is rebuilt.
+    fn rebuild_lighting_meshes(&self) {
+        let chunks: Vec<(i32, i32)> = self.near_meshes.get().keys().copied().collect();
+        for (chunk_x, chunk_z) in chunks {
+            self.build_near_chunk(chunk_x, chunk_z);
+        }
+        self.runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .far_dirty = true;
+        self.rebuild_far_meshes_if_settled();
     }
 
     fn refresh_frame(&self) {
@@ -716,28 +679,20 @@ impl BoxcraftApp {
                 .depth_tested()
                 // The SGFX renderer corrects this reference perspective as its canvas resizes.
                 .reference_aspect(REFERENCE_ASPECT);
-        let far_meshes = self.far_meshes.get();
-        let sun_phase = self.sun_phase.get();
-        for (bucket, mesh) in far_meshes.iter().enumerate() {
-            if let Some(mesh) = mesh {
-                frame = frame.draw(
-                    SgfxCanvasDraw::new(Arc::clone(mesh), transform)
-                        .tint(terrain_bucket_tint(bucket, sun_phase))
-                        .texture(Arc::clone(&self.block_atlas)),
-                );
-            }
+        if let Some(mesh) = self.far_mesh.get().filter(|mesh| mesh.triangle_count() > 0) {
+            frame = frame.draw(
+                SgfxCanvasDraw::new(Arc::clone(&mesh), transform)
+                    .tint(Color::WHITE)
+                    .texture(Arc::clone(&self.block_atlas)),
+            );
         }
         let near_meshes = self.near_meshes.get();
-        for meshes in near_meshes.values() {
-            for (bucket, mesh) in meshes.iter().enumerate() {
-                if let Some(mesh) = mesh {
-                    frame = frame.draw(
-                        SgfxCanvasDraw::new(Arc::clone(mesh), transform)
-                            .tint(terrain_bucket_tint(bucket, sun_phase))
-                            .texture(Arc::clone(&self.block_atlas)),
-                    );
-                }
-            }
+        for meshes in near_meshes.values().filter(|mesh| mesh.triangle_count() > 0) {
+            frame = frame.draw(
+                SgfxCanvasDraw::new(Arc::clone(meshes), transform)
+                    .tint(Color::WHITE)
+                    .texture(Arc::clone(&self.block_atlas)),
+            );
         }
         self.canvas_frame.set(Arc::new(frame));
     }
@@ -984,6 +939,7 @@ impl Application for BoxcraftApp {
         });
         if let Some(sun_phase) = sun_phase {
             self.sun_phase.set(sun_phase);
+            self.rebuild_lighting_meshes();
         }
         // Stream terrain chunks around the player and drop distant ones.
         self.refresh_chunk_set();
@@ -1014,14 +970,14 @@ fn build_boxcraft_content(app: &BoxcraftApp) -> Box<dyn View> {
     Box::new(app.content())
 }
 
-/// Convert one terrain chunk into per-bucket canvas vertices.
-///
-/// Textured SGFX ignores vertex color, so illumination lives in the bucket
-/// draw tint: triangles are grouped by their baked sky-light and ambient
-/// occlusion so each group can be tinted uniformly.
-fn append_bucket_vertices(
+/// Convert one terrain chunk into a single textured mesh with interpolated
+/// vertex lighting. The SGFX texture vertex-color pipeline multiplies the
+/// atlas sample by this color at every fragment, so no triangle light buckets
+/// or block-sized draw tints are needed.
+fn append_lit_vertices(
     core_mesh: &boxcraft_core::Mesh,
-    bucket_vertices: &mut [Vec<SgfxCanvasVertex>; TERRAIN_LIGHT_BUCKETS],
+    sun_phase: f32,
+    vertices: &mut Vec<SgfxCanvasVertex>,
 ) {
     for triangle in core_mesh.indices.chunks_exact(3) {
         let [first, second, third] = triangle else {
@@ -1034,13 +990,11 @@ fn append_bucket_vertices(
         ) else {
             continue;
         };
-        let bucket = terrain_triangle_light_bucket([first, second, third]);
-        let vertices = &mut bucket_vertices[bucket];
         for vertex in [first, second, third] {
             vertices.push(
                 SgfxCanvasVertex::new(
                     [vertex.position.x, vertex.position.y, vertex.position.z, 1.0],
-                    [1.0, 1.0, 1.0, 1.0],
+                    terrain_vertex_color(vertex, sun_phase),
                 )
                 .with_tex_coord(atlas_tex_coord(
                     vertex.block,
@@ -1269,67 +1223,20 @@ fn block_texture_tile(block: Block, normal: Vec3) -> u32 {
     }
 }
 
-/// Place a complete triangle in a stable coarse illumination bucket.
-///
-/// Textured SGFX draws apply one tint uniform per draw, rather than a color
-/// per vertex. Averaging the three source corners keeps each triangle's bucket
-/// stable; the bucket encodes the sky/torch split so night can darken only
-/// the sky channel while torch light keeps glowing.
-fn terrain_triangle_light_bucket(vertices: [&boxcraft_core::Vertex; 3]) -> usize {
-    let sky = vertices
-        .into_iter()
-        .map(|vertex| sunlight_brightness(vertex.light, vertex.ambient_occlusion))
-        .sum::<f32>()
-        / 3.0;
-    let torch = vertices
-        .into_iter()
-        .map(|vertex| vertex.torch_light)
-        .sum::<f32>()
-        / 3.0;
-    let sky_class =
-        ((sky.clamp(0.0, 1.0) * SKY_LIGHT_BUCKETS as f32) as usize).min(SKY_LIGHT_BUCKETS - 1);
-    let torch_class = if torch < 0.08 {
-        0
-    } else if torch < 0.5 {
-        1
-    } else {
-        2
-    };
-    sky_class * TORCH_LIGHT_BUCKETS + torch_class
-}
-
-/// Build the uniform tint used for one illuminated terrain bucket.
-///
-/// The sky channel follows the day cycle while the torch channel stays
-/// constant and warm, so placed torches glow through the night.
-fn terrain_bucket_tint(bucket: usize, sun_phase: f32) -> Color {
-    let bucket = bucket.min(TERRAIN_LIGHT_BUCKETS - 1);
-    let sky_class = bucket / TORCH_LIGHT_BUCKETS;
-    let torch_class = bucket % TORCH_LIGHT_BUCKETS;
-    let sky_brightness = (sky_class as f32 + 0.5) / SKY_LIGHT_BUCKETS as f32;
-    let torch_brightness = if torch_class == 0 {
-        0.0
-    } else {
-        (torch_class as f32 + 0.5) / TORCH_LIGHT_BUCKETS as f32
-    };
+/// Compose the two Minecraft-style light channels into a warm RGB vertex
+/// multiplier. Sky light follows the day cycle; block light remains warm and
+/// independent, so a torch still illuminates an enclosed room at night.
+fn terrain_vertex_color(vertex: &boxcraft_core::Vertex, sun_phase: f32) -> [f32; 4] {
     let daylight = sunlight_daylight(sun_phase);
-    let sky_term = sky_brightness * daylight;
-    Color::rgb(
-        sky_term.max(torch_brightness),
-        (sky_term * 0.97).max(torch_brightness * 0.76),
-        (sky_term * 0.92).max(torch_brightness * 0.48),
-    )
-}
-
-/// Combine a moving directional sun with the terrain's baked occlusion light.
-/// Combine the baked propagated sky light with corner ambient occlusion.
-///
-/// The value is static per vertex: the moving sun is applied later as the
-/// bucket draw tint, so day and night cycle without remeshing terrain.
-fn sunlight_brightness(sky_light: f32, ambient_occlusion: f32) -> f32 {
-    let ambient = 0.10 + sky_light.clamp(0.0, 1.0) * 0.90;
-    let occlusion = 0.52 + ambient_occlusion.clamp(0.0, 1.0) * 0.48;
-    (ambient * occlusion).clamp(0.0, 1.0)
+    let sky = vertex.light.clamp(0.0, 1.0) * daylight;
+    let torch = vertex.torch_light.clamp(0.0, 1.0);
+    let ao = (0.68 + vertex.ambient_occlusion.clamp(0.0, 1.0) * 0.32).clamp(0.0, 1.0);
+    [
+        (sky + torch).clamp(0.0, 1.0) * ao,
+        (sky * 0.94 + torch * 0.68).clamp(0.0, 1.0) * ao,
+        (sky * 0.88 + torch * 0.32).clamp(0.0, 1.0) * ao,
+        1.0,
+    ]
 }
 
 /// Return the normalized directional sun vector for a day-cycle phase.
@@ -1379,33 +1286,22 @@ mod tests {
     }
 
     #[test]
-    fn terrain_light_bucket_is_bounded_and_ordered() {
+    fn terrain_vertex_color_keeps_torch_light_at_night() {
         let dark = boxcraft_core::Vertex {
             light: 0.0,
             torch_light: 0.0,
             ..test_vertex()
         };
-        let sky_lit = boxcraft_core::Vertex {
-            light: 1.0,
-            torch_light: 0.0,
-            ..test_vertex()
-        };
         let torch_lit = boxcraft_core::Vertex {
-            light: 1.0,
+            light: 0.0,
             torch_light: 0.9,
             ..test_vertex()
         };
-        assert_eq!(terrain_triangle_light_bucket([&dark, &dark, &dark]), 0);
-        assert!(terrain_triangle_light_bucket([&sky_lit, &sky_lit, &sky_lit]) > 0);
-        assert_eq!(
-            terrain_triangle_light_bucket([&torch_lit, &torch_lit, &torch_lit]),
-            TERRAIN_LIGHT_BUCKETS - 1
-        );
-
-        // At night the torch bucket stays bright while pure sky goes dark.
-        let night = terrain_bucket_tint(0, 0.5);
-        let torch_night = terrain_bucket_tint(TERRAIN_LIGHT_BUCKETS - 1, 0.5);
-        assert!(torch_night.r > night.r * 2.0);
+        let dark_color = terrain_vertex_color(&dark, 0.5);
+        let torch_color = terrain_vertex_color(&torch_lit, 0.5);
+        assert!(dark_color[0] < 0.01);
+        assert!(torch_color[0] > torch_color[1]);
+        assert!(torch_color[0] > dark_color[0] + 0.4);
     }
 
     fn test_vertex() -> boxcraft_core::Vertex {

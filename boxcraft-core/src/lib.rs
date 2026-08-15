@@ -1580,14 +1580,11 @@ fn vertex_ambient_occlusion(world: &World, position: IVec3, normal: Vec3, corner
 }
 
 fn vertex_light(world: &World, position: IVec3, normal: Vec3, corner: Vec3) -> [f32; 2] {
-    // Smooth lighting: each corner averages the propagated sky light in the
-    // four outside cells sharing that corner, so cave mouths, overhangs and
-    // hill shade fade gradually across faces instead of switching per block.
-    // Solid sample cells count as darkness: skipping them made enclosed
-    // corners average only their few air cells, so freshly dug shafts and
-    // tunnels read brighter than the open surface around them.
-    // The same corner sampling runs for block light, keeping torch glow
-    // smooth across nearby faces; per-face directional shading is gone.
+    // Minecraft-style smooth lighting: each corner averages the propagated
+    // sky and block-light values in the four cells sharing that corner. The
+    // light arrays are already flood-filled at integer levels (0..15), so the
+    // renderer only interpolates the baked field; it never invents a local
+    // per-block shadow or a minimum ambient value here.
     let normal_axis = if normal.x != 0.0 {
         0
     } else if normal.y != 0.0 {
@@ -1647,7 +1644,7 @@ fn vertex_light(world: &World, position: IVec3, normal: Vec3, corner: Vec3) -> [
     }
     let sky_light = sum / samples.max(1.0);
     let torch_light = torch_sum / samples.max(1.0);
-    [0.16 + sky_light * 0.84, 0.05 + torch_light * 0.95]
+    [sky_light, torch_light]
 }
 
 /// A first-person camera derived from a player's head position and rotation.
@@ -2548,7 +2545,7 @@ mod tests {
                 && vertex.atlas_uv[1] <= 1.0
                 && vertex.ambient_occlusion > 0.0
                 && vertex.ambient_occlusion <= 1.0
-                && vertex.light > 0.0
+                && vertex.light >= 0.0
                 && vertex.light <= 1.0
         }));
         let darkest_top_corner = mesh

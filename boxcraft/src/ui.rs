@@ -1254,8 +1254,8 @@ fn atlas_pixel(tile: usize, x: u32, y: u32) -> [u8; 4] {
         // Sand: soft wind ripples.
         7 => {
             let ripple = ((fy * 0.7 + grain * 6.0).sin() * 8.0) as i16;
-            let base = 218 + ripple as u8;
-            [base, (base as i16 - 27) as u8, (base as i16 - 92) as u8]
+            let base = (218 + ripple).clamp(0, u8::MAX as i16);
+            [base as u8, (base - 27) as u8, (base - 92) as u8]
         }
         // Water: gentle layered current.
         8 => {

@@ -1022,7 +1022,14 @@ pub struct Mesh {
 ///
 /// A triangle mesh with one quad for each air-adjacent block face.
 pub fn mesh_world(world: &World) -> Mesh {
-    mesh_region(world, 0, world.width as i32 - 1, 0, world.depth as i32 - 1)
+    mesh_region(
+        world,
+        0,
+        world.width as i32 - 1,
+        0,
+        world.depth as i32 - 1,
+        false,
+    )
 }
 
 /// Builds the exposed-face mesh of one horizontal terrain chunk.
@@ -1043,10 +1050,45 @@ pub fn mesh_chunk(world: &World, chunk_x: i32, chunk_z: i32) -> Mesh {
         (chunk_x + 1) * CHUNK_SIZE - 1,
         chunk_z * CHUNK_SIZE,
         (chunk_z + 1) * CHUNK_SIZE - 1,
+        false,
     )
 }
 
-fn mesh_region(world: &World, min_x: i32, max_x: i32, min_z: i32, max_z: i32) -> Mesh {
+/// Builds a distance-reduced chunk mesh for the merged far ring.
+///
+/// Faces whose only exposure is to an unlit enclosed space (deep cave and
+/// interior pockets with zero propagated sky light) are omitted: they can
+/// never be seen from outside, and the near ring restores full detail before
+/// the player can reach them.
+///
+/// # Arguments
+///
+/// * `world` - Voxel data containing the chunk.
+/// * `chunk_x` - Chunk coordinate on the x axis in `[CHUNK_SIZE]` units.
+/// * `chunk_z` - Chunk coordinate on the z axis in `[CHUNK_SIZE]` units.
+///
+/// # Returns
+///
+/// The chunk mesh without geometry that is only visible from unlit interiors.
+pub fn mesh_chunk_lod(world: &World, chunk_x: i32, chunk_z: i32) -> Mesh {
+    mesh_region(
+        world,
+        chunk_x * CHUNK_SIZE,
+        (chunk_x + 1) * CHUNK_SIZE - 1,
+        chunk_z * CHUNK_SIZE,
+        (chunk_z + 1) * CHUNK_SIZE - 1,
+        true,
+    )
+}
+
+fn mesh_region(
+    world: &World,
+    min_x: i32,
+    max_x: i32,
+    min_z: i32,
+    max_z: i32,
+    skip_dark_interior: bool,
+) -> Mesh {
     const FACE_UVS: [[f32; 2]; 4] = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
     const FACES: [(IVec3, [Vec3; 4]); 6] = [
         (
@@ -1114,10 +1156,14 @@ fn mesh_region(world: &World, min_x: i32, max_x: i32, min_z: i32, max_z: i32) ->
                     continue;
                 };
                 for (normal, corners) in FACES {
+                    let neighbor = position + normal;
                     if world
-                        .block(position + normal)
+                        .block(neighbor)
                         .is_none_or(|neighbor| !neighbor.is_renderable())
                     {
+                        if skip_dark_interior && world.sunlight(neighbor) == 0 {
+                            continue;
+                        }
                         // Still water sits slightly below a full block, the
                         // classic inset surface that makes shorelines readable.
                         let inset_surface = block == Block::Water
@@ -1243,6 +1289,9 @@ fn vertex_light(world: &World, position: IVec3, normal: Vec3, corner: Vec3) -> f
     // Smooth lighting: each corner averages the propagated sky light in the
     // four outside cells sharing that corner, so cave mouths, overhangs and
     // hill shade fade gradually across faces instead of switching per block.
+    // Solid sample cells count as darkness: skipping them made enclosed
+    // corners average only their few air cells, so freshly dug shafts and
+    // tunnels read brighter than the open surface around them.
     let normal_axis = if normal.x != 0.0 {
         0
     } else if normal.y != 0.0 {
@@ -1265,7 +1314,7 @@ fn vertex_light(world: &World, position: IVec3, normal: Vec3, corner: Vec3) -> f
         tangent += 1;
     }
     let mut sum = 0.0;
-    let mut samples = 0.0;
+    let mut samples = 0.0_f32;
     for first in [tangent_ranges[0].0, tangent_ranges[0].1] {
         for second in [tangent_ranges[1].0, tangent_ranges[1].1] {
             let mut offset = normal_offset;
@@ -1284,14 +1333,15 @@ fn vertex_light(world: &World, position: IVec3, normal: Vec3, corner: Vec3) -> f
                 index += 1;
             }
             let cell = position + offset;
-            if world.block(cell).is_some_and(Block::is_solid) {
-                continue;
-            }
-            sum += world.sunlight(cell) as f32 / 15.0;
+            sum += if world.block(cell).is_some_and(Block::is_solid) {
+                0.0
+            } else {
+                world.sunlight(cell) as f32 / 15.0
+            };
             samples += 1.0;
         }
     }
-    let sky_light = if samples > 0.0 { sum / samples } else { 0.0 };
+    let sky_light = sum / samples.max(1.0);
     let face_light = if normal.y > 0.0 {
         1.0
     } else if normal.y < 0.0 {
@@ -1840,8 +1890,8 @@ fn initial_t(origin: f32, direction: f32, step: i32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        Block, CHUNK_SIZE, IVec3, Mat4, Mesh, Player, PlayerInput, SEA_LEVEL, Vec3, World,
-        mesh_chunk, mesh_world, terrain_height,
+        Block, IVec3, Mat4, Mesh, Player, PlayerInput, SEA_LEVEL, Vec3, World, mesh_chunk,
+        mesh_chunk_lod, mesh_world, terrain_height,
     };
 
     #[test]
@@ -2080,6 +2130,83 @@ mod tests {
         }
         assert_eq!(combined.vertices.len(), full.vertices.len());
         assert_eq!(combined.indices.len(), full.indices.len());
+    }
+
+    #[test]
+    fn lod_meshing_drops_unlit_interiors_but_keeps_exposed_faces() {
+        let mut world = World::new(8, 8, 8);
+        for y in 0..8 {
+            for z in 0..8 {
+                for x in 0..8 {
+                    world.set(IVec3::new(x, y, z), Block::Stone);
+                }
+            }
+        }
+        // Hollow out a fully enclosed pocket: its walls are only visible from
+        // an unlit interior, so the LOD mesh must skip them.
+        for y in 2..6 {
+            for z in 2..6 {
+                for x in 2..6 {
+                    world.set(IVec3::new(x, y, z), Block::Air);
+                }
+            }
+        }
+        world.recompute_sunlight();
+        assert_eq!(world.sunlight(IVec3::new(4, 4, 4)), 0);
+
+        let full = mesh_chunk(&world, 0, 0);
+        let lod = mesh_chunk_lod(&world, 0, 0);
+        assert!(lod.vertices.len() < full.vertices.len());
+        assert!(!lod.vertices.is_empty());
+        // The exposed exterior faces survive the reduction.
+        assert!(lod.vertices.iter().any(|vertex| vertex.position.x == 0.0));
+    }
+
+    #[test]
+    fn enclosed_corners_are_darker_than_open_surface() {
+        // Open flat ground: every corner sample is a sky-lit air cell.
+        let mut open = World::new(8, 8, 8);
+        for z in 0..8 {
+            for x in 0..8 {
+                open.set(IVec3::new(x, 3, z), Block::Stone);
+            }
+        }
+        open.recompute_sunlight();
+        let open_light = mesh_world(&open)
+            .vertices
+            .iter()
+            .filter(|vertex| vertex.normal.y > 0.0 && vertex.position.y == 4.0)
+            .map(|vertex| vertex.light)
+            .fold(0.0_f32, f32::max);
+
+        // A one-block shaft through solid rock: three of each floor corner's
+        // four sample cells are rock and must count as darkness, so the shaft
+        // floor stays darker than open ground instead of reading full sky.
+        let mut shaft = World::new(8, 8, 8);
+        for y in 0..8 {
+            for z in 0..8 {
+                for x in 0..8 {
+                    shaft.set(IVec3::new(x, y, z), Block::Stone);
+                }
+            }
+        }
+        for y in 1..8 {
+            shaft.set(IVec3::new(4, y, 4), Block::Air);
+        }
+        shaft.recompute_sunlight();
+        assert_eq!(shaft.sunlight(IVec3::new(4, 1, 4)), 15);
+        let shaft_light = mesh_world(&shaft)
+            .vertices
+            .iter()
+            .filter(|vertex| vertex.normal.y > 0.0 && vertex.position.y == 1.0)
+            .map(|vertex| vertex.light)
+            .fold(1.0_f32, f32::min);
+
+        assert!(open_light > 0.99);
+        assert!(
+            shaft_light < open_light - 0.25,
+            "shaft floor light {shaft_light} should be clearly darker than open {open_light}"
+        );
     }
 
     #[test]

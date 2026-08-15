@@ -326,6 +326,8 @@ pub enum Block {
     Water,
     /// High-altitude or cold-biome snow cover.
     Snow,
+    /// Non-solid light source that propagates warm block light.
+    Torch,
 }
 
 impl Block {
@@ -335,7 +337,7 @@ impl Block {
     ///
     /// `true` for blocks that stop movement, excluding air and water.
     pub const fn is_solid(self) -> bool {
-        !matches!(self, Self::Air | Self::Water)
+        !matches!(self, Self::Air | Self::Water | Self::Torch)
     }
 
     /// Returns whether the block contributes faces to a terrain mesh.
@@ -365,6 +367,7 @@ impl Block {
             Self::Sand => [0.76, 0.67, 0.39, 1.0],
             Self::Water => [0.08, 0.34, 0.72, 0.82],
             Self::Snow => [0.93, 0.95, 0.98, 1.0],
+            Self::Torch => [0.95, 0.78, 0.45, 1.0],
         }
     }
 
@@ -378,8 +381,49 @@ impl Block {
             Self::Air => 0,
             Self::Water => 2,
             Self::Leaves => 1,
+            Self::Torch => 0,
             _ => 15,
         }
+    }
+
+    /// Returns how much block light this block emits on its own.
+    ///
+    /// # Returns
+    ///
+    /// An emission level from 0 (no emission) to 15 (brightest source).
+    pub const fn light_emission(self) -> u8 {
+        match self {
+            Self::Torch => 14,
+            _ => 0,
+        }
+    }
+
+    /// Returns whether camera rays stop on this block for editing.
+    ///
+    /// # Returns
+    ///
+    /// `true` for solid blocks and torches, which players can break.
+    pub const fn is_targetable(self) -> bool {
+        self.is_solid() || matches!(self, Self::Torch)
+    }
+
+    /// Returns whether this block hides the neighbouring block faces.
+    ///
+    /// # Returns
+    ///
+    /// `true` for fully opaque blocks; water, torches and air show the
+    /// terrain behind them.
+    pub const fn occludes(self) -> bool {
+        self.is_solid()
+    }
+
+    /// Returns whether players can place this block from the hotbar.
+    ///
+    /// # Returns
+    ///
+    /// `true` for structural blocks and torches.
+    pub const fn is_placeable(self) -> bool {
+        self.is_solid() || matches!(self, Self::Torch)
     }
 }
 
@@ -397,6 +441,7 @@ pub struct World {
     depth: usize,
     blocks: Vec<Block>,
     sunlight: Vec<u8>,
+    block_light: Vec<u8>,
 }
 
 impl World {
@@ -418,6 +463,7 @@ impl World {
             depth,
             blocks: vec![Block::Air; width.saturating_mul(height).saturating_mul(depth)],
             sunlight: vec![0; width.saturating_mul(height).saturating_mul(depth)],
+            block_light: vec![0; width.saturating_mul(height).saturating_mul(depth)],
         }
     }
 
@@ -464,7 +510,7 @@ impl World {
             }
         }
         world.populate_trees(seed);
-        world.recompute_sunlight();
+        world.recompute_light();
         world
     }
 
@@ -523,6 +569,21 @@ impl World {
             .unwrap_or(15)
     }
 
+    /// Returns the propagated block light at `position`, from 0 to 15.
+    ///
+    /// # Arguments
+    ///
+    /// * `position` - Voxel coordinate to examine.
+    ///
+    /// # Returns
+    ///
+    /// The stored block light, or darkness outside the world bounds.
+    pub fn block_light(&self, position: IVec3) -> u8 {
+        self.index(position)
+            .map(|index| self.block_light[index])
+            .unwrap_or(0)
+    }
+
     /// Recomputes sky light for the whole world with a flood fill.
     ///
     /// Direct sky columns receive light 15 that travels downward without
@@ -530,7 +591,12 @@ impl World {
     /// translucent materials, losing opacity per crossed block. This is what
     /// makes overhangs, cave mouths and the shaded side of hills fall dark
     /// gradually instead of switching per face.
-    pub fn recompute_sunlight(&mut self) {
+    pub fn recompute_light(&mut self) {
+        self.recompute_sky_light();
+        self.recompute_block_light_global();
+    }
+
+    fn recompute_sky_light(&mut self) {
         self.sunlight.iter_mut().for_each(|light| *light = 0);
         let mut queue = std::collections::VecDeque::new();
         for z in 0..self.depth as i32 {
@@ -580,6 +646,66 @@ impl World {
         }
     }
 
+    fn recompute_block_light_global(&mut self) {
+        self.block_light.iter_mut().for_each(|light| *light = 0);
+        let mut queue = std::collections::VecDeque::new();
+        for index in 0..self.blocks.len() {
+            let emission = self.blocks[index].light_emission();
+            if emission > 0 {
+                self.block_light[index] = emission;
+                queue.push_back(index);
+            }
+        }
+        self.propagate_block_light(&mut queue, i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+    }
+
+    /// Flood block light from `queue` within an optional region bound.
+    ///
+    /// When region bounds are supplied, propagation stops at the region edge;
+    /// `usize::MAX`/`usize::MIN` sentinels disable the bound.
+    fn propagate_block_light(
+        &mut self,
+        queue: &mut std::collections::VecDeque<usize>,
+        max_x: i32,
+        max_z: i32,
+        min_x: i32,
+        min_z: i32,
+    ) {
+        while let Some(index) = queue.pop_front() {
+            let level = self.block_light[index];
+            if level <= 1 {
+                continue;
+            }
+            let position = self.position_of(index);
+            for offset in [
+                IVec3::new(-1, 0, 0),
+                IVec3::new(1, 0, 0),
+                IVec3::new(0, -1, 0),
+                IVec3::new(0, 1, 0),
+                IVec3::new(0, 0, -1),
+                IVec3::new(0, 0, 1),
+            ] {
+                let neighbor = position + offset;
+                if neighbor.x > max_x
+                    || neighbor.x < min_x
+                    || neighbor.z > max_z
+                    || neighbor.z < min_z
+                {
+                    continue;
+                }
+                let Some(neighbor_index) = self.index(neighbor) else {
+                    continue;
+                };
+                let opacity = self.blocks[neighbor_index].light_opacity().max(1);
+                let spread = level.saturating_sub(opacity);
+                if spread > self.block_light[neighbor_index] {
+                    self.block_light[neighbor_index] = spread;
+                    queue.push_back(neighbor_index);
+                }
+            }
+        }
+    }
+
     fn fill_column(&mut self, seed: u64, x: i32, z: i32, column: &TerrainColumn) {
         for y in 0..=column.height {
             let mut block = if y == column.height {
@@ -615,7 +741,7 @@ impl World {
     ///
     /// * `center` - Edited voxel around which light is refreshed.
     /// * `radius` - Horizontal refresh radius; values below 17 are raised.
-    pub fn recompute_sunlight_around(&mut self, center: IVec3, radius: i32) {
+    pub fn recompute_light_around(&mut self, center: IVec3, radius: i32) {
         let radius = radius.max(17);
         let min_x = (center.x - radius).max(0);
         let max_x = (center.x + radius).min(self.width as i32 - 1);
@@ -624,21 +750,21 @@ impl World {
         if min_x > max_x || min_z > max_z {
             return;
         }
-        let in_region = |position: IVec3| {
-            position.x >= min_x && position.x <= max_x && position.z >= min_z && position.z <= max_z
-        };
 
-        // Clear the region, then reseed direct sky columns inside it.
-        let mut queue = std::collections::VecDeque::new();
+        // Clear both light channels inside the region.
         for y in 0..self.height as i32 {
             for z in min_z..=max_z {
                 for x in min_x..=max_x {
                     if let Some(index) = self.index(IVec3::new(x, y, z)) {
                         self.sunlight[index] = 0;
+                        self.block_light[index] = 0;
                     }
                 }
             }
         }
+
+        // Reseed direct sky columns inside the region.
+        let mut sky_queue = std::collections::VecDeque::new();
         for z in min_z..=max_z {
             for x in min_x..=max_x {
                 let mut level = 15_u8;
@@ -653,23 +779,37 @@ impl World {
                     }
                     if let Some(index) = self.index(position) {
                         self.sunlight[index] = level;
-                        queue.push_back(index);
+                        sky_queue.push_back(index);
                     }
                 }
             }
         }
-        // Shell cells keep their valid pre-edit light; spread it inwards.
-        let shell_x = if center.x - radius < 0 {
-            None
-        } else {
-            Some(min_x - 1)
-        };
-        // Build the one-cell ring just outside the region on the x/z plane.
+
+        // Reseed block-light emitters inside the region.
+        let mut block_queue = std::collections::VecDeque::new();
+        for y in 0..self.height as i32 {
+            for z in min_z..=max_z {
+                for x in min_x..=max_x {
+                    let position = IVec3::new(x, y, z);
+                    let Some(index) = self.index(position) else {
+                        continue;
+                    };
+                    let emission = self.blocks[index].light_emission();
+                    if emission > 0 {
+                        self.block_light[index] = emission;
+                        block_queue.push_back(index);
+                    }
+                }
+            }
+        }
+
+        // The one-cell ring outside the region still holds valid pre-edit
+        // light for both channels; seed it inwards.
         let mut shell_cells = Vec::new();
         for y in 0..self.height as i32 {
-            if let Some(x) = shell_x {
+            if min_x - 1 >= 0 {
                 for z in min_z..=max_z {
-                    shell_cells.push(IVec3::new(x, y, z));
+                    shell_cells.push(IVec3::new(min_x - 1, y, z));
                 }
             }
             if max_x + 1 < self.width as i32 {
@@ -688,18 +828,17 @@ impl World {
                 }
             }
         }
+        let in_region = |position: IVec3| {
+            position.x >= min_x && position.x <= max_x && position.z >= min_z && position.z <= max_z
+        };
         for shell in shell_cells {
-            let shell_level = self.sunlight(shell);
-            if shell_level <= 1 {
-                continue;
-            }
             for offset in [
                 IVec3::new(-1, 0, 0),
                 IVec3::new(1, 0, 0),
                 IVec3::new(0, -1, 0),
+                IVec3::new(0, 1, 0),
                 IVec3::new(0, 0, -1),
                 IVec3::new(0, 0, 1),
-                IVec3::new(0, 1, 0),
             ] {
                 let neighbor = shell + offset;
                 if !in_region(neighbor) {
@@ -709,14 +848,29 @@ impl World {
                     continue;
                 };
                 let opacity = self.blocks[neighbor_index].light_opacity().max(1);
-                let spread = shell_level.saturating_sub(opacity);
-                if spread > self.sunlight[neighbor_index] {
-                    self.sunlight[neighbor_index] = spread;
-                    queue.push_back(neighbor_index);
+                let sky_spread = self.sunlight(shell).saturating_sub(opacity);
+                if sky_spread > self.sunlight[neighbor_index] {
+                    self.sunlight[neighbor_index] = sky_spread;
+                    sky_queue.push_back(neighbor_index);
+                }
+                let block_spread = self.block_light(shell).saturating_sub(opacity);
+                if block_spread > self.block_light[neighbor_index] {
+                    self.block_light[neighbor_index] = block_spread;
+                    block_queue.push_back(neighbor_index);
                 }
             }
         }
-        // Flood the refreshed light throughout the region only.
+
+        // Flood both refreshed channels throughout the region only.
+        self.propagate_sky_light(&mut sky_queue, in_region);
+        self.propagate_block_light_bounded(&mut block_queue, in_region);
+    }
+
+    fn propagate_sky_light(
+        &mut self,
+        queue: &mut std::collections::VecDeque<usize>,
+        in_region: impl Fn(IVec3) -> bool,
+    ) {
         while let Some(index) = queue.pop_front() {
             let level = self.sunlight[index];
             if level <= 1 {
@@ -727,9 +881,9 @@ impl World {
                 IVec3::new(-1, 0, 0),
                 IVec3::new(1, 0, 0),
                 IVec3::new(0, -1, 0),
+                IVec3::new(0, 1, 0),
                 IVec3::new(0, 0, -1),
                 IVec3::new(0, 0, 1),
-                IVec3::new(0, 1, 0),
             ] {
                 let neighbor = position + offset;
                 if !in_region(neighbor) {
@@ -742,6 +896,42 @@ impl World {
                 let spread = level.saturating_sub(opacity);
                 if spread > self.sunlight[neighbor_index] {
                     self.sunlight[neighbor_index] = spread;
+                    queue.push_back(neighbor_index);
+                }
+            }
+        }
+    }
+
+    fn propagate_block_light_bounded(
+        &mut self,
+        queue: &mut std::collections::VecDeque<usize>,
+        in_region: impl Fn(IVec3) -> bool,
+    ) {
+        while let Some(index) = queue.pop_front() {
+            let level = self.block_light[index];
+            if level <= 1 {
+                continue;
+            }
+            let position = self.position_of(index);
+            for offset in [
+                IVec3::new(-1, 0, 0),
+                IVec3::new(1, 0, 0),
+                IVec3::new(0, -1, 0),
+                IVec3::new(0, 1, 0),
+                IVec3::new(0, 0, -1),
+                IVec3::new(0, 0, 1),
+            ] {
+                let neighbor = position + offset;
+                if !in_region(neighbor) {
+                    continue;
+                }
+                let Some(neighbor_index) = self.index(neighbor) else {
+                    continue;
+                };
+                let opacity = self.blocks[neighbor_index].light_opacity().max(1);
+                let spread = level.saturating_sub(opacity);
+                if spread > self.block_light[neighbor_index] {
+                    self.block_light[neighbor_index] = spread;
                     queue.push_back(neighbor_index);
                 }
             }
@@ -834,7 +1024,7 @@ impl World {
             origin.y.floor() as i32,
             origin.z.floor() as i32,
         );
-        if self.block(cell).is_some_and(Block::is_solid) {
+        if self.block(cell).is_some_and(Block::is_targetable) {
             return Some(RaycastHit {
                 position: cell,
                 normal: IVec3::default(),
@@ -872,7 +1062,7 @@ impl World {
             if distance > max_distance || !self.contains(cell) {
                 return None;
             }
-            if self.block(cell).is_some_and(Block::is_solid) {
+            if self.block(cell).is_some_and(Block::is_targetable) {
                 return Some(RaycastHit {
                     position: cell,
                     normal,
@@ -1001,6 +1191,8 @@ pub struct Vertex {
     pub ambient_occlusion: f32,
     /// Directional sky-light multiplier for this corner, from `0.0` to `1.0`.
     pub light: f32,
+    /// Propagated block-light multiplier for this corner, from `0.0` to `1.0`.
+    pub torch_light: f32,
 }
 
 /// Triangulated exposed faces of a [`World`].
@@ -1155,13 +1347,23 @@ fn mesh_region(
                 else {
                     continue;
                 };
+                // Torches render as a thin free-standing model that neither
+                // occludes neighbours nor participates in face culling.
+                if block == Block::Torch {
+                    append_torch_mesh(world, &mut mesh, position);
+                    continue;
+                }
                 for (normal, corners) in FACES {
                     let neighbor = position + normal;
-                    if world
-                        .block(neighbor)
-                        .is_none_or(|neighbor| !neighbor.is_renderable())
-                    {
-                        if skip_dark_interior && world.sunlight(neighbor) == 0 {
+                    let face_visible = world.block(neighbor).is_none_or(|neighbor| {
+                        // Water and torches are transparent: terrain shows
+                        // through them, but water hides its own internal faces.
+                        !neighbor.occludes() && !(block == Block::Water && neighbor == Block::Water)
+                    });
+                    if face_visible {
+                        if skip_dark_interior
+                            && world.sunlight(neighbor).max(world.block_light(neighbor)) == 0
+                        {
                             continue;
                         }
                         // Still water sits slightly below a full block, the
@@ -1180,6 +1382,7 @@ fn mesh_region(
                             } else {
                                 corner
                             };
+                            let light = vertex_light(world, position, normal, corner);
                             mesh.vertices.push(Vertex {
                                 position: offset + corner,
                                 normal,
@@ -1189,7 +1392,8 @@ fn mesh_region(
                                 ambient_occlusion: vertex_ambient_occlusion(
                                     world, position, normal, corner,
                                 ),
-                                light: vertex_light(world, position, normal, corner),
+                                light: light[0],
+                                torch_light: light[1],
                             });
                         }
                         mesh.indices.extend_from_slice(&[
@@ -1245,11 +1449,101 @@ fn atlas_uv(block: Block, normal: Vec3, local_uv: [f32; 2]) -> [f32; 2] {
         Block::Sand => [3.0, 1.0],
         Block::Water => [0.0, 2.0],
         Block::Snow => [1.0, 2.0],
+        // The torch samples a narrow sub-region of its tile so the thin
+        // model shows the stick texture rather than the tile average.
+        Block::Torch => [2.0, 2.0],
+    };
+    let local_uv = if block == Block::Torch {
+        [0.42 + local_uv[0] * 0.16, local_uv[1] * 0.7]
+    } else {
+        local_uv
     };
     [
         (tile[0] + local_uv[0]) / ATLAS_COLUMNS,
         (tile[1] + local_uv[1]) / ATLAS_ROWS,
     ]
+}
+
+/// Append the thin torch model: a small box with an unoccluded appearance.
+///
+/// The model never culls against neighbours and skips its bottom face so it
+/// reads as a stick standing on the ground.
+fn append_torch_mesh(world: &World, mesh: &mut Mesh, position: IVec3) {
+    const FACE_UVS_TORCH: [[f32; 2]; 4] = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+    const MIN: Vec3 = Vec3::new(0.4375, 0.0, 0.4375);
+    const MAX: Vec3 = Vec3::new(0.5625, 0.625, 0.5625);
+    let offset = Vec3::new(position.x as f32, position.y as f32, position.z as f32);
+    let faces: [(IVec3, [Vec3; 4]); 5] = [
+        (
+            IVec3::new(-1, 0, 0),
+            [
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(0.0, 0.0, 1.0),
+                Vec3::new(0.0, 1.0, 1.0),
+                Vec3::new(0.0, 1.0, 0.0),
+            ],
+        ),
+        (
+            IVec3::new(1, 0, 0),
+            [
+                Vec3::new(1.0, 0.0, 1.0),
+                Vec3::new(1.0, 0.0, 0.0),
+                Vec3::new(1.0, 1.0, 0.0),
+                Vec3::new(1.0, 1.0, 1.0),
+            ],
+        ),
+        (
+            IVec3::new(0, 0, -1),
+            [
+                Vec3::new(1.0, 0.0, 0.0),
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(0.0, 1.0, 0.0),
+                Vec3::new(1.0, 1.0, 0.0),
+            ],
+        ),
+        (
+            IVec3::new(0, 0, 1),
+            [
+                Vec3::new(0.0, 0.0, 1.0),
+                Vec3::new(1.0, 0.0, 1.0),
+                Vec3::new(1.0, 1.0, 1.0),
+                Vec3::new(0.0, 1.0, 1.0),
+            ],
+        ),
+        (
+            IVec3::new(0, 1, 0),
+            [
+                Vec3::new(0.0, 1.0, 0.0),
+                Vec3::new(0.0, 1.0, 1.0),
+                Vec3::new(1.0, 1.0, 1.0),
+                Vec3::new(1.0, 1.0, 0.0),
+            ],
+        ),
+    ];
+    for (normal, corners) in faces {
+        let first = mesh.vertices.len() as u32;
+        let normal_vec = Vec3::new(normal.x as f32, normal.y as f32, normal.z as f32);
+        for (corner, uv) in corners.into_iter().zip(FACE_UVS_TORCH) {
+            let scaled = Vec3::new(
+                MIN.x + corner.x * (MAX.x - MIN.x),
+                MIN.y + corner.y * (MAX.y - MIN.y),
+                MIN.z + corner.z * (MAX.z - MIN.z),
+            );
+            let light = vertex_light(world, position, normal_vec, corner);
+            mesh.vertices.push(Vertex {
+                position: offset + scaled,
+                normal: normal_vec,
+                color: Block::Torch.color(),
+                block: Block::Torch,
+                atlas_uv: atlas_uv(Block::Torch, normal_vec, uv),
+                ambient_occlusion: 1.0,
+                light: light[0],
+                torch_light: light[1],
+            });
+        }
+        mesh.indices
+            .extend_from_slice(&[first, first + 1, first + 2, first, first + 2, first + 3]);
+    }
 }
 
 fn vertex_ambient_occlusion(world: &World, position: IVec3, normal: Vec3, corner: Vec3) -> f32 {
@@ -1285,13 +1579,15 @@ fn vertex_ambient_occlusion(world: &World, position: IVec3, normal: Vec3, corner
     1.0 - occluders as f32 * 0.18
 }
 
-fn vertex_light(world: &World, position: IVec3, normal: Vec3, corner: Vec3) -> f32 {
+fn vertex_light(world: &World, position: IVec3, normal: Vec3, corner: Vec3) -> [f32; 2] {
     // Smooth lighting: each corner averages the propagated sky light in the
     // four outside cells sharing that corner, so cave mouths, overhangs and
     // hill shade fade gradually across faces instead of switching per block.
     // Solid sample cells count as darkness: skipping them made enclosed
     // corners average only their few air cells, so freshly dug shafts and
     // tunnels read brighter than the open surface around them.
+    // The same corner sampling runs for block light, keeping torch glow
+    // smooth across nearby faces; per-face directional shading is gone.
     let normal_axis = if normal.x != 0.0 {
         0
     } else if normal.y != 0.0 {
@@ -1314,6 +1610,7 @@ fn vertex_light(world: &World, position: IVec3, normal: Vec3, corner: Vec3) -> f
         tangent += 1;
     }
     let mut sum = 0.0;
+    let mut torch_sum = 0.0_f32;
     let mut samples = 0.0_f32;
     for first in [tangent_ranges[0].0, tangent_ranges[0].1] {
         for second in [tangent_ranges[1].0, tangent_ranges[1].1] {
@@ -1333,25 +1630,24 @@ fn vertex_light(world: &World, position: IVec3, normal: Vec3, corner: Vec3) -> f
                 index += 1;
             }
             let cell = position + offset;
-            sum += if world.block(cell).is_some_and(Block::is_solid) {
+            let sky = if world.block(cell).is_some_and(Block::is_solid) {
                 0.0
             } else {
                 world.sunlight(cell) as f32 / 15.0
             };
+            let torch = if world.block(cell).is_some_and(Block::is_solid) {
+                0.0
+            } else {
+                world.block_light(cell) as f32 / 15.0
+            };
+            sum += sky;
+            torch_sum += torch;
             samples += 1.0;
         }
     }
     let sky_light = sum / samples.max(1.0);
-    let face_light = if normal.y > 0.0 {
-        1.0
-    } else if normal.y < 0.0 {
-        0.52
-    } else if normal.x > 0.0 || normal.z > 0.0 {
-        0.82
-    } else {
-        0.68
-    };
-    (0.16 + sky_light * 0.84) * face_light
+    let torch_light = torch_sum / samples.max(1.0);
+    [0.16 + sky_light * 0.84, 0.05 + torch_light * 0.95]
 }
 
 /// A first-person camera derived from a player's head position and rotation.
@@ -1537,7 +1833,7 @@ impl Player {
     pub fn break_block(&self, world: &mut World, reach: f32) -> Option<RaycastHit> {
         let hit = world.raycast(self.camera().position, self.camera().forward(), reach)?;
         if world.set(hit.position, Block::Air) {
-            world.recompute_sunlight_around(hit.position, 17);
+            world.recompute_light_around(hit.position, 17);
             Some(hit)
         } else {
             None
@@ -1555,16 +1851,18 @@ impl Player {
     ///
     /// The placed coordinate, or `None` if there is no valid, unoccupied air cell.
     pub fn place_block(&self, world: &mut World, reach: f32) -> Option<IVec3> {
-        if !self.selected_block.is_solid() {
+        if !self.selected_block.is_placeable() {
             return None;
         }
         let hit = world.raycast(self.camera().position, self.camera().forward(), reach)?;
         let target = hit.position + hit.normal;
-        if world.block(target) != Some(Block::Air) || self.aabb_intersects_voxel(target) {
+        if world.block(target) != Some(Block::Air)
+            || (self.selected_block.is_solid() && self.aabb_intersects_voxel(target))
+        {
             return None;
         }
         if world.set(target, self.selected_block) {
-            world.recompute_sunlight_around(target, 17);
+            world.recompute_light_around(target, 17);
             Some(target)
         } else {
             None
@@ -2001,7 +2299,7 @@ mod tests {
                 }
             }
         }
-        world.recompute_sunlight();
+        world.recompute_light();
         // Open sky above the slab is fully lit.
         assert_eq!(world.sunlight(IVec3::new(4, 4, 4)), 15);
         // Deep under the slab the column stays dark; near the open edge the
@@ -2024,7 +2322,7 @@ mod tests {
                 }
             }
         }
-        world.recompute_sunlight();
+        world.recompute_light();
         assert!(world.sunlight(IVec3::new(2, 5, 2)) < world.sunlight(IVec3::new(2, 7, 2)));
     }
 
@@ -2045,9 +2343,9 @@ mod tests {
                     Block::Air
                 },
             );
-            world.recompute_sunlight_around(edit, 17);
+            world.recompute_light_around(edit, 17);
             let mut reference = world.clone();
-            reference.recompute_sunlight();
+            reference.recompute_light();
             for y in 0..32 {
                 for z in 0..64 {
                     for x in 0..64 {
@@ -2060,6 +2358,168 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn incrementally_built_enclosed_room_goes_dark_and_leaks_light_gradually() {
+        let mut world = World::new(13, 10, 13);
+        // Build a floating shell room exactly the way gameplay does: one
+        // block at a time, refreshing sunlight locally after each placement.
+        // Shell spans x/z 3..=9 and y 1..=5 with a hollow 5x3x5 interior.
+        let mut placements = Vec::new();
+        for y in 1..=5 {
+            for z in 3..=9 {
+                for x in 3..=9 {
+                    let on_shell = y == 1 || y == 5 || x == 3 || x == 9 || z == 3 || z == 9;
+                    if on_shell {
+                        placements.push(IVec3::new(x, y, z));
+                    }
+                }
+            }
+        }
+        for position in placements {
+            world.set(position, Block::Stone);
+            world.recompute_light_around(position, 17);
+        }
+
+        // The incremental local refreshes must agree with a full recompute.
+        let mut reference = world.clone();
+        reference.recompute_light();
+        for y in 0..10 {
+            for z in 0..13 {
+                for x in 0..13 {
+                    assert_eq!(
+                        world.sunlight(IVec3::new(x, y, z)),
+                        reference.sunlight(IVec3::new(x, y, z)),
+                        "incremental room light mismatch at {x},{y},{z}"
+                    );
+                }
+            }
+        }
+
+        // Every interior cell of the sealed room is fully dark.
+        for y in 2..=4 {
+            for z in 4..=8 {
+                for x in 4..=8 {
+                    assert_eq!(world.sunlight(IVec3::new(x, y, z)), 0);
+                }
+            }
+        }
+        // Baked floor light inside is far darker than the roof outside.
+        let mesh = mesh_world(&world);
+        let interior_floor = mesh
+            .vertices
+            .iter()
+            .filter(|vertex| {
+                vertex.normal.y > 0.0
+                    && vertex.position.y == 2.0
+                    && vertex.position.x > 4.0
+                    && vertex.position.x < 8.0
+                    && vertex.position.z > 4.0
+                    && vertex.position.z < 8.0
+            })
+            .map(|vertex| vertex.light)
+            .fold(1.0_f32, f32::min);
+        let roof = mesh
+            .vertices
+            .iter()
+            .filter(|vertex| vertex.normal.y > 0.0 && vertex.position.y == 6.0)
+            .map(|vertex| vertex.light)
+            .fold(0.0_f32, f32::max);
+        assert!(roof > 0.99);
+        assert!(
+            interior_floor < roof - 0.7,
+            "room floor {interior_floor} must be much darker than roof {roof}"
+        );
+
+        // Opening one window lets light leak in and fade with distance.
+        world.set(IVec3::new(6, 3, 3), Block::Air);
+        world.recompute_light_around(IVec3::new(6, 3, 3), 17);
+        // The window cell itself is one step from open air (14), and each
+        // interior cell fades one more level with distance from the opening.
+        assert_eq!(world.sunlight(IVec3::new(6, 3, 3)), 14);
+        assert_eq!(world.sunlight(IVec3::new(6, 3, 4)), 13);
+        assert_eq!(world.sunlight(IVec3::new(6, 3, 5)), 12);
+        assert!(world.sunlight(IVec3::new(6, 3, 8)) < world.sunlight(IVec3::new(6, 3, 4)));
+    }
+
+    #[test]
+    fn torches_emit_block_light_that_spreads_and_fades() {
+        let mut world = World::new(16, 8, 16);
+        for z in 0..16 {
+            for x in 0..16 {
+                world.set(IVec3::new(x, 0, z), Block::Stone);
+            }
+        }
+        let mut player = Player::new(Vec3::new(8.5, 1.01, 8.5));
+        player.selected_block = Block::Torch;
+        player.pitch = -1.54;
+        let placed = player.place_block(&mut world, 4.0).unwrap();
+        assert_eq!(world.block(placed), Some(Block::Torch));
+
+        // The torch emits level 14 and light fades one level per block.
+        assert_eq!(world.block_light(placed), 14);
+        assert_eq!(world.block_light(placed + IVec3::new(1, 0, 0)), 13);
+        assert_eq!(world.block_light(placed + IVec3::new(3, 0, 0)), 11);
+        assert_eq!(world.sunlight(placed), 15, "sky light is unaffected");
+
+        // Mesh vertices near the torch carry baked torch light.
+        let mesh = mesh_world(&world);
+        assert!(mesh.vertices.iter().any(|vertex| vertex.torch_light > 0.8));
+
+        // The torch is not solid: players pass through it, and it can be
+        // broken by aiming at it.
+        assert!(!Block::Torch.is_solid());
+        let hit = world
+            .raycast(player.camera().position, player.camera().forward(), 4.0)
+            .unwrap();
+        assert_eq!(hit.position, placed);
+        assert!(player.break_block(&mut world, 4.0).is_some());
+        assert_eq!(world.block(placed), Some(Block::Air));
+        assert_eq!(world.block_light(placed + IVec3::new(1, 0, 0)), 0);
+    }
+
+    #[test]
+    fn enclosed_room_with_torch_is_lit_by_block_light_only() {
+        let mut world = World::new(13, 10, 13);
+        for y in 1..=5 {
+            for z in 3..=9 {
+                for x in 3..=9 {
+                    let on_shell = y == 1 || y == 5 || x == 3 || x == 9 || z == 3 || z == 9;
+                    if on_shell {
+                        world.set(IVec3::new(x, y, z), Block::Stone);
+                    }
+                }
+            }
+        }
+        world.set(IVec3::new(6, 2, 6), Block::Torch);
+        world.recompute_light();
+
+        // Sky light cannot enter the sealed room...
+        assert_eq!(world.sunlight(IVec3::new(6, 2, 6)), 0);
+        // ...but the torch floods the interior through the shell gap at 15?
+        // No: the torch sits inside, so nearby walls and floor are lit.
+        assert_eq!(world.block_light(IVec3::new(6, 2, 6)), 14);
+        assert!(world.block_light(IVec3::new(4, 2, 4)) >= 8);
+
+        let mesh = mesh_world(&world);
+        let interior_floor_light = mesh
+            .vertices
+            .iter()
+            .filter(|vertex| {
+                vertex.normal.y > 0.0
+                    && vertex.position.y == 2.0
+                    && vertex.position.x >= 4.0
+                    && vertex.position.x <= 8.0
+                    && vertex.position.z >= 4.0
+                    && vertex.position.z <= 8.0
+            })
+            .map(|vertex| vertex.torch_light)
+            .fold(0.0_f32, f32::max);
+        assert!(
+            interior_floor_light > 0.5,
+            "torch-lit floor should bake meaningful block light"
+        );
     }
 
     #[test]
@@ -2151,7 +2611,7 @@ mod tests {
                 }
             }
         }
-        world.recompute_sunlight();
+        world.recompute_light();
         assert_eq!(world.sunlight(IVec3::new(4, 4, 4)), 0);
 
         let full = mesh_chunk(&world, 0, 0);
@@ -2171,7 +2631,7 @@ mod tests {
                 open.set(IVec3::new(x, 3, z), Block::Stone);
             }
         }
-        open.recompute_sunlight();
+        open.recompute_light();
         let open_light = mesh_world(&open)
             .vertices
             .iter()
@@ -2193,7 +2653,7 @@ mod tests {
         for y in 1..8 {
             shaft.set(IVec3::new(4, y, 4), Block::Air);
         }
-        shaft.recompute_sunlight();
+        shaft.recompute_light();
         assert_eq!(shaft.sunlight(IVec3::new(4, 1, 4)), 15);
         let shaft_light = mesh_world(&shaft)
             .vertices

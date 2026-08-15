@@ -25,8 +25,13 @@ const ATLAS_COLUMNS: u32 = 4;
 const ATLAS_ROWS: u32 = 4;
 const DAY_LENGTH_SECONDS: f32 = 150.0;
 const SUNLIGHT_UPDATES_PER_SECOND: f32 = 4.0;
-/// Number of retained textured terrain draws, from deepest shadow to sunlight.
-const TERRAIN_LIGHT_BUCKETS: usize = 8;
+/// Light buckets: sky classes crossed with torch-light classes.
+///
+/// The SGFX canvas frame caps at 240 draws. The near ring is 5×5 chunks, so
+/// 9 buckets keep terrain at 25×9 + 9 = 234 draws for any render distance.
+const SKY_LIGHT_BUCKETS: usize = 3;
+const TORCH_LIGHT_BUCKETS: usize = 3;
+const TERRAIN_LIGHT_BUCKETS: usize = SKY_LIGHT_BUCKETS * TORCH_LIGHT_BUCKETS;
 /// Terrain chunks built per idle tick while streaming the world in.
 const CHUNKS_PER_FRAME: usize = 3;
 /// Default and inclusive bounds for the configurable render distance.
@@ -329,6 +334,10 @@ impl BoxcraftApp {
                 }
                 KeyCode::Char('8') => {
                     self.select_block(7, Block::Air);
+                    true
+                }
+                KeyCode::Char('9') => {
+                    self.select_block(8, Block::Torch);
                     true
                 }
                 KeyCode::Char('o') | KeyCode::Char('O') => {
@@ -1147,6 +1156,21 @@ fn atlas_pixel(tile: usize, x: u32, y: u32) -> [u8; 4] {
                 (230.0 + pocket * 24.0) as u8,
             ]
         }
+        // Torch: a bright ember head over a wooden stick. The thin torch
+        // model samples only the tile's narrow centre column.
+        10 => {
+            let ember = x >= 13 && x < 19 && y < 8;
+            let stick = x >= 14 && x < 18 && y >= 8 && y < 23;
+            if ember && y < 4 {
+                [255, 236, 170]
+            } else if ember {
+                [244, 168, 66]
+            } else if stick {
+                [124, 82, 44]
+            } else {
+                [38, 30, 24]
+            }
+        }
         _ => [255, 0, 255],
     };
     for component in &mut color {
@@ -1240,6 +1264,7 @@ fn block_texture_tile(block: Block, normal: Vec3) -> u32 {
         Block::Sand => 7,
         Block::Water => 8,
         Block::Snow => 9,
+        Block::Torch => 10,
         Block::Air => 0,
     }
 }
@@ -1247,36 +1272,52 @@ fn block_texture_tile(block: Block, normal: Vec3) -> u32 {
 /// Place a complete triangle in a stable coarse illumination bucket.
 ///
 /// Textured SGFX draws apply one tint uniform per draw, rather than a color
-/// per vertex. Averaging the three source corners makes each triangle's shadow
-/// band stable while retaining both baked AO and moving sun direction.
+/// per vertex. Averaging the three source corners keeps each triangle's bucket
+/// stable; the bucket encodes the sky/torch split so night can darken only
+/// the sky channel while torch light keeps glowing.
 fn terrain_triangle_light_bucket(vertices: [&boxcraft_core::Vertex; 3]) -> usize {
-    let brightness = vertices
+    let sky = vertices
         .into_iter()
         .map(|vertex| sunlight_brightness(vertex.light, vertex.ambient_occlusion))
         .sum::<f32>()
         / 3.0;
-    terrain_light_bucket(brightness)
-}
-
-/// Convert normalized illumination to a bounded terrain-draw bucket.
-fn terrain_light_bucket(brightness: f32) -> usize {
-    ((brightness.clamp(0.0, 1.0) * TERRAIN_LIGHT_BUCKETS as f32) as usize)
-        .min(TERRAIN_LIGHT_BUCKETS - 1)
+    let torch = vertices
+        .into_iter()
+        .map(|vertex| vertex.torch_light)
+        .sum::<f32>()
+        / 3.0;
+    let sky_class =
+        ((sky.clamp(0.0, 1.0) * SKY_LIGHT_BUCKETS as f32) as usize).min(SKY_LIGHT_BUCKETS - 1);
+    let torch_class = if torch < 0.08 {
+        0
+    } else if torch < 0.5 {
+        1
+    } else {
+        2
+    };
+    sky_class * TORCH_LIGHT_BUCKETS + torch_class
 }
 
 /// Build the uniform tint used for one illuminated terrain bucket.
 ///
-/// The color temperature follows the moving sun as well as the bucket's
-/// brightness. This is deliberately a draw tint so it affects textured pixels
-/// even though SGFX's textured pipeline ignores `SgfxCanvasVertex::color`.
+/// The sky channel follows the day cycle while the torch channel stays
+/// constant and warm, so placed torches glow through the night.
 fn terrain_bucket_tint(bucket: usize, sun_phase: f32) -> Color {
-    let brightness =
-        ((bucket.min(TERRAIN_LIGHT_BUCKETS - 1) as f32) + 0.5) / TERRAIN_LIGHT_BUCKETS as f32;
+    let bucket = bucket.min(TERRAIN_LIGHT_BUCKETS - 1);
+    let sky_class = bucket / TORCH_LIGHT_BUCKETS;
+    let torch_class = bucket % TORCH_LIGHT_BUCKETS;
+    let sky_brightness = (sky_class as f32 + 0.5) / SKY_LIGHT_BUCKETS as f32;
+    let torch_brightness = if torch_class == 0 {
+        0.0
+    } else {
+        (torch_class as f32 + 0.5) / TORCH_LIGHT_BUCKETS as f32
+    };
     let daylight = sunlight_daylight(sun_phase);
+    let sky_term = sky_brightness * daylight;
     Color::rgb(
-        brightness,
-        brightness * (0.86 + daylight * 0.14),
-        brightness * (0.69 + daylight * 0.31),
+        sky_term.max(torch_brightness),
+        (sky_term * 0.97).max(torch_brightness * 0.76),
+        (sky_term * 0.92).max(torch_brightness * 0.48),
     )
 }
 
@@ -1318,6 +1359,7 @@ fn block_name(block: Block) -> &'static str {
         Block::Sand => "Sand",
         Block::Water => "Water",
         Block::Snow => "Snow",
+        Block::Torch => "Torch",
     }
 }
 
@@ -1332,16 +1374,50 @@ mod tests {
         let water = atlas_tex_coord(Block::Water, Vec3::new(0.0, 1.0, 0.0), [0.0, 2.0]);
 
         assert!(top[1] > bottom[1]);
-        assert!(top[1] < 1.0 / ATLAS_ROWS);
-        assert!(water[1] > 2.0 / ATLAS_ROWS);
+        assert!(top[1] < 1.0 / ATLAS_ROWS as f32);
+        assert!(water[1] > 2.0 / ATLAS_ROWS as f32);
     }
 
     #[test]
     fn terrain_light_bucket_is_bounded_and_ordered() {
-        assert_eq!(terrain_light_bucket(-1.0), 0);
-        assert_eq!(terrain_light_bucket(0.0), 0);
-        assert!(terrain_light_bucket(0.25) > terrain_light_bucket(0.0));
-        assert_eq!(terrain_light_bucket(1.0), TERRAIN_LIGHT_BUCKETS - 1);
-        assert_eq!(terrain_light_bucket(2.0), TERRAIN_LIGHT_BUCKETS - 1);
+        let dark = boxcraft_core::Vertex {
+            light: 0.0,
+            torch_light: 0.0,
+            ..test_vertex()
+        };
+        let sky_lit = boxcraft_core::Vertex {
+            light: 1.0,
+            torch_light: 0.0,
+            ..test_vertex()
+        };
+        let torch_lit = boxcraft_core::Vertex {
+            light: 1.0,
+            torch_light: 0.9,
+            ..test_vertex()
+        };
+        assert_eq!(terrain_triangle_light_bucket([&dark, &dark, &dark]), 0);
+        assert!(terrain_triangle_light_bucket([&sky_lit, &sky_lit, &sky_lit]) > 0);
+        assert_eq!(
+            terrain_triangle_light_bucket([&torch_lit, &torch_lit, &torch_lit]),
+            TERRAIN_LIGHT_BUCKETS - 1
+        );
+
+        // At night the torch bucket stays bright while pure sky goes dark.
+        let night = terrain_bucket_tint(0, 0.5);
+        let torch_night = terrain_bucket_tint(TERRAIN_LIGHT_BUCKETS - 1, 0.5);
+        assert!(torch_night.r > night.r * 2.0);
+    }
+
+    fn test_vertex() -> boxcraft_core::Vertex {
+        boxcraft_core::Vertex {
+            position: Vec3::zero(),
+            normal: Vec3::new(0.0, 1.0, 0.0),
+            color: [1.0; 4],
+            block: Block::Grass,
+            atlas_uv: [0.0, 0.0],
+            ambient_occlusion: 1.0,
+            light: 0.0,
+            torch_light: 0.0,
+        }
     }
 }

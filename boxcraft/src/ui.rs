@@ -74,8 +74,8 @@ impl PressedKeys {
 
 struct Runtime {
     last_idle: Instant,
-    fps_sample_start: Instant,
-    frames_since_sample: u32,
+    present_sample_start: Instant,
+    presented_since_sample: u32,
     day_seconds: f32,
     sunlight_step: u64,
     build_queue: VecDeque<(i32, i32)>,
@@ -90,8 +90,8 @@ impl Runtime {
         let now = Instant::now();
         Self {
             last_idle: now,
-            fps_sample_start: now,
-            frames_since_sample: 0,
+            present_sample_start: now,
+            presented_since_sample: 0,
             day_seconds: 0.0,
             sunlight_step: 0,
             build_queue: VecDeque::new(),
@@ -100,6 +100,18 @@ impl Runtime {
             far_dirty: false,
             far_chunks: Vec::new(),
         }
+    }
+}
+
+#[derive(Debug)]
+struct TerrainMesh {
+    gpu: Arc<SgfxMesh>,
+    has_block_light: bool,
+}
+
+impl TerrainMesh {
+    fn triangle_count(&self) -> usize {
+        self.gpu.triangle_count()
     }
 }
 
@@ -119,13 +131,12 @@ struct BoxcraftApp {
     render_distance: State<i32>,
     canvas_frame: State<Arc<SgfxCanvasFrame>>,
     near_core_meshes: State<Arc<HashMap<(i32, i32), Arc<boxcraft_core::Mesh>>>>,
-    near_meshes: State<Arc<HashMap<(i32, i32), Arc<SgfxMesh>>>>,
+    near_meshes: State<Arc<HashMap<(i32, i32), Arc<TerrainMesh>>>>,
     far_core_meshes: State<Arc<HashMap<(i32, i32), Arc<boxcraft_core::Mesh>>>>,
-    far_meshes: State<Arc<HashMap<(i32, i32), Arc<SgfxMesh>>>>,
+    far_meshes: State<Arc<HashMap<(i32, i32), Arc<TerrainMesh>>>>,
     mesh_revision: State<u64>,
     frame_revision: State<u64>,
     sun_phase: State<f32>,
-    fps: State<u32>,
     fps_text: State<String>,
     position: State<String>,
     selected_block: State<String>,
@@ -169,7 +180,7 @@ impl BoxcraftApp {
             ),
             near_meshes: State::new(
                 StateId::new(11),
-                Arc::new(HashMap::<(i32, i32), Arc<SgfxMesh>>::new()),
+                Arc::new(HashMap::<(i32, i32), Arc<TerrainMesh>>::new()),
             ),
             far_core_meshes: State::new(
                 StateId::new(26),
@@ -177,12 +188,11 @@ impl BoxcraftApp {
             ),
             far_meshes: State::new(
                 StateId::new(24),
-                Arc::new(HashMap::<(i32, i32), Arc<SgfxMesh>>::new()),
+                Arc::new(HashMap::<(i32, i32), Arc<TerrainMesh>>::new()),
             ),
             mesh_revision: State::new(StateId::new(12), 0),
             frame_revision: State::new(StateId::new(13), 0),
             sun_phase: State::new(StateId::new(20), 0.0),
-            fps: State::new(StateId::new(14), 0),
             fps_text: State::new(StateId::new(15), String::from("FPS: 0")),
             position: State::new(StateId::new(16), String::from("Position: loading")),
             selected_block: State::new(StateId::new(17), String::from("1: Grass")),
@@ -272,7 +282,7 @@ impl BoxcraftApp {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .extend(retired.into_iter().chain(retired_far));
         self.near_meshes
-            .update(|chunks| *chunks = Arc::new(HashMap::<(i32, i32), Arc<SgfxMesh>>::new()));
+            .update(|chunks| *chunks = Arc::new(HashMap::<(i32, i32), Arc<TerrainMesh>>::new()));
         self.near_core_meshes.set(Arc::new(
             HashMap::<(i32, i32), Arc<boxcraft_core::Mesh>>::new(),
         ));
@@ -280,7 +290,7 @@ impl BoxcraftApp {
             HashMap::<(i32, i32), Arc<boxcraft_core::Mesh>>::new(),
         ));
         self.far_meshes
-            .set(Arc::new(HashMap::<(i32, i32), Arc<SgfxMesh>>::new()));
+            .set(Arc::new(HashMap::<(i32, i32), Arc<TerrainMesh>>::new()));
         *self
             .visible_space
             .lock()
@@ -633,7 +643,7 @@ impl BoxcraftApp {
                 *meshes = Arc::new(next);
             });
             self.far_meshes
-                .set(Arc::new(HashMap::<(i32, i32), Arc<SgfxMesh>>::new()));
+                .set(Arc::new(HashMap::<(i32, i32), Arc<TerrainMesh>>::new()));
             changed = true;
         }
         let mut missing: Vec<(i32, i32)> = desired
@@ -746,9 +756,17 @@ impl BoxcraftApp {
             groups.entry(group).or_default().push(core_mesh);
         }
         for (group, core_meshes) in groups {
+            let has_block_light = core_meshes
+                .iter()
+                .any(|core_mesh| mesh_has_block_light(core_mesh));
+            let daylight = if has_block_light {
+                sunlight_daylight(self.sun_phase.get())
+            } else {
+                1.0
+            };
             let mut vertices = Vec::new();
             for core_mesh in core_meshes {
-                append_lit_vertices(&core_mesh, self.sun_phase.get(), &mut vertices);
+                append_lit_vertices(&core_mesh, daylight, &mut vertices);
             }
             if vertices.is_empty() {
                 continue;
@@ -771,7 +789,13 @@ impl BoxcraftApp {
                     handle
                 }
             };
-            meshes.insert(group, SgfxMesh::with_handle(handle, revision, vertices));
+            meshes.insert(
+                group,
+                Arc::new(TerrainMesh {
+                    gpu: SgfxMesh::with_handle(handle, revision, vertices),
+                    has_block_light,
+                }),
+            );
         }
         self.far_core_meshes.set(Arc::new(core_meshes));
 
@@ -824,8 +848,14 @@ impl BoxcraftApp {
     }
 
     fn update_near_mesh_from_core(&self, key: (i32, i32), core_mesh: &boxcraft_core::Mesh) -> bool {
+        let has_block_light = mesh_has_block_light(core_mesh);
+        let daylight = if has_block_light {
+            sunlight_daylight(self.sun_phase.get())
+        } else {
+            1.0
+        };
         let mut vertices = Vec::new();
-        append_lit_vertices(core_mesh, self.sun_phase.get(), &mut vertices);
+        append_lit_vertices(core_mesh, daylight, &mut vertices);
         self.mesh_revision
             .update(|revision| *revision = revision.wrapping_add(1));
         let revision = self.mesh_revision.get();
@@ -847,7 +877,10 @@ impl BoxcraftApp {
                 handle
             }
         };
-        let mesh = SgfxMesh::with_handle(handle, revision, vertices);
+        let mesh = Arc::new(TerrainMesh {
+            gpu: SgfxMesh::with_handle(handle, revision, vertices),
+            has_block_light,
+        });
         self.near_meshes.update(|chunks| {
             let mut next = (**chunks).clone();
             next.insert(key, mesh);
@@ -856,20 +889,74 @@ impl BoxcraftApp {
         true
     }
 
-    /// Re-bake the resident vertex colors when the moving sun crosses a
-    /// lighting step. The expensive voxel propagation stays unchanged; only
-    /// the current sky-channel composition is rebuilt.
+    /// Re-bake only meshes where warm block light must remain independent of
+    /// the moving sun. Sky-only meshes keep immutable vertex data and apply
+    /// daylight through the draw uniform instead.
     fn rebuild_lighting_meshes(&self) -> bool {
         let mut rebuilt = false;
         let core_meshes = self.near_core_meshes.get();
-        for (key, core_mesh) in core_meshes.iter() {
+        for (key, core_mesh) in core_meshes
+            .iter()
+            .filter(|(_, core_mesh)| mesh_has_block_light(core_mesh))
+        {
             rebuilt |= self.update_near_mesh_from_core(*key, core_mesh);
         }
-        self.runtime
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .far_dirty = true;
-        rebuilt | self.rebuild_far_meshes_if_settled()
+        rebuilt | self.rebuild_block_lit_far_meshes()
+    }
+
+    fn rebuild_block_lit_far_meshes(&self) -> bool {
+        let mut groups: HashMap<(i32, i32), Vec<Arc<boxcraft_core::Mesh>>> = HashMap::new();
+        for (chunk, core_mesh) in self.far_core_meshes.get().iter() {
+            let group = (
+                chunk.0.div_euclid(FAR_MESH_GROUP_SIZE),
+                chunk.1.div_euclid(FAR_MESH_GROUP_SIZE),
+            );
+            groups.entry(group).or_default().push(Arc::clone(core_mesh));
+        }
+        groups.retain(|_, meshes| meshes.iter().any(|mesh| mesh_has_block_light(mesh)));
+        if groups.is_empty() {
+            return false;
+        }
+
+        self.mesh_revision
+            .update(|revision| *revision = revision.wrapping_add(1));
+        let revision = self.mesh_revision.get();
+        let daylight = sunlight_daylight(self.sun_phase.get());
+        let mut rebuilt = HashMap::with_capacity(groups.len());
+        for (group, core_meshes) in groups {
+            let mut vertices = Vec::new();
+            for core_mesh in core_meshes {
+                append_lit_vertices(&core_mesh, daylight, &mut vertices);
+            }
+            if vertices.is_empty() {
+                continue;
+            }
+            let Some(handle) = self
+                .far_handles
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&group)
+                .copied()
+            else {
+                continue;
+            };
+            rebuilt.insert(
+                group,
+                Arc::new(TerrainMesh {
+                    gpu: SgfxMesh::with_handle(handle, revision, vertices),
+                    has_block_light: true,
+                }),
+            );
+        }
+        if rebuilt.is_empty() {
+            return false;
+        }
+        self.far_meshes.update(|meshes| {
+            let mut next = (**meshes).clone();
+            next.extend(rebuilt);
+            *meshes = Arc::new(next);
+        });
+        true
     }
 
     fn refresh_frame(&self) {
@@ -887,6 +974,7 @@ impl BoxcraftApp {
                 .depth_tested()
                 // The SGFX renderer corrects this reference perspective as its canvas resizes.
                 .reference_aspect(REFERENCE_ASPECT);
+        let daylight = sunlight_daylight(self.sun_phase.get());
         let far_meshes = self.far_meshes.get();
         for (_, mesh) in far_meshes.iter().filter(|(chunk, mesh)| {
             mesh.triangle_count() > 0
@@ -898,9 +986,14 @@ impl BoxcraftApp {
                     FAR_MESH_GROUP_SIZE,
                 )
         }) {
+            let tint = if mesh.has_block_light {
+                Color::WHITE
+            } else {
+                Color::rgb(daylight, daylight, daylight)
+            };
             frame = frame.draw(
-                SgfxCanvasDraw::new(Arc::clone(mesh), transform)
-                    .tint(Color::WHITE)
+                SgfxCanvasDraw::new(Arc::clone(&mesh.gpu), transform)
+                    .tint(tint)
                     .texture(Arc::clone(&self.block_atlas)),
             );
         }
@@ -915,9 +1008,14 @@ impl BoxcraftApp {
                     1,
                 )
         }) {
+            let tint = if meshes.has_block_light {
+                Color::WHITE
+            } else {
+                Color::rgb(daylight, daylight, daylight)
+            };
             frame = frame.draw(
-                SgfxCanvasDraw::new(Arc::clone(meshes), transform)
-                    .tint(Color::WHITE)
+                SgfxCanvasDraw::new(Arc::clone(&meshes.gpu), transform)
+                    .tint(tint)
                     .texture(Arc::clone(&self.block_atlas)),
             );
         }
@@ -1126,7 +1224,7 @@ impl Application for BoxcraftApp {
 
     fn on_idle(&mut self) {
         let now = Instant::now();
-        let (delta_seconds, fps, sun_phase) = {
+        let (delta_seconds, sun_phase) = {
             let mut runtime = match self.runtime.lock() {
                 Ok(runtime) => runtime,
                 Err(poisoned) => poisoned.into_inner(),
@@ -1142,17 +1240,7 @@ impl Application for BoxcraftApp {
                 runtime.sunlight_step = sunlight_step;
                 (runtime.day_seconds / DAY_LENGTH_SECONDS).rem_euclid(1.0)
             });
-            runtime.frames_since_sample = runtime.frames_since_sample.saturating_add(1);
-            let elapsed = now.saturating_duration_since(runtime.fps_sample_start);
-            let fps = (elapsed.as_millis() >= 500).then(|| {
-                let fps = (runtime.frames_since_sample as f64 / elapsed.as_secs_f64())
-                    .round()
-                    .clamp(0.0, u32::MAX as f64) as u32;
-                runtime.frames_since_sample = 0;
-                runtime.fps_sample_start = now;
-                fps
-            });
-            (delta_seconds, fps, sun_phase)
+            (delta_seconds, sun_phase)
         };
 
         let input = self.keys.get().player_input();
@@ -1169,19 +1257,41 @@ impl Application for BoxcraftApp {
         let mut frame_changed = camera_changed;
         if let Some(sun_phase) = sun_phase {
             self.sun_phase.set(sun_phase);
+            // Sky-only meshes change through draw uniforms, so the frame still
+            // needs a cheap command refresh even when no vertex data changed.
+            frame_changed = true;
             frame_changed |= self.rebuild_lighting_meshes();
         }
         // Stream terrain chunks around the player and drop distant ones.
         frame_changed |= self.refresh_chunk_set();
         frame_changed |= self.process_build_queue(CHUNKS_PER_FRAME);
         frame_changed |= self.rebuild_far_meshes_if_settled();
-        if let Some(fps) = fps {
-            self.fps.set(fps);
-            self.fps_text.set(format!("FPS: {fps}"));
-            self.update_hud();
-        }
         if frame_changed {
             self.refresh_frame();
+        }
+    }
+
+    fn on_frame_presented(&mut self, _ctx: &WindowContext) {
+        let now = Instant::now();
+        let sample = {
+            let mut runtime = self
+                .runtime
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            runtime.presented_since_sample = runtime.presented_since_sample.saturating_add(1);
+            let elapsed = now.saturating_duration_since(runtime.present_sample_start);
+            (elapsed.as_millis() >= 750).then(|| {
+                let fps = runtime.presented_since_sample as f64 / elapsed.as_secs_f64();
+                runtime.presented_since_sample = 0;
+                runtime.present_sample_start = now;
+                fps
+            })
+        };
+        if let Some(fps) = sample {
+            let frame_ms = if fps > 0.0 { 1_000.0 / fps } else { 0.0 };
+            self.fps_text
+                .set(format!("FPS: {fps:.1} · {frame_ms:.1} ms"));
+            self.update_hud();
         }
     }
 
@@ -1208,7 +1318,7 @@ fn build_boxcraft_content(app: &BoxcraftApp) -> Box<dyn View> {
 /// or block-sized draw tints are needed.
 fn append_lit_vertices(
     core_mesh: &boxcraft_core::Mesh,
-    sun_phase: f32,
+    daylight: f32,
     vertices: &mut Vec<SgfxCanvasVertex>,
 ) {
     for triangle in core_mesh.indices.chunks_exact(3) {
@@ -1226,7 +1336,7 @@ fn append_lit_vertices(
             vertices.push(
                 SgfxCanvasVertex::new(
                     [vertex.position.x, vertex.position.y, vertex.position.z, 1.0],
-                    terrain_vertex_color(vertex, sun_phase),
+                    terrain_vertex_color(vertex, daylight),
                 )
                 .with_tex_coord(atlas_tex_coord(
                     vertex.block,
@@ -1236,6 +1346,12 @@ fn append_lit_vertices(
             );
         }
     }
+}
+
+fn mesh_has_block_light(mesh: &boxcraft_core::Mesh) -> bool {
+    mesh.vertices
+        .iter()
+        .any(|vertex| vertex.torch_light > f32::EPSILON)
 }
 
 /// Create the compact RGBA8 atlas used by every visible terrain block.
@@ -1458,8 +1574,7 @@ fn block_texture_tile(block: Block, normal: Vec3) -> u32 {
 /// Compose the two Minecraft-style light channels into a warm RGB vertex
 /// multiplier. Sky light follows the day cycle; block light remains warm and
 /// independent, so a torch still illuminates an enclosed room at night.
-fn terrain_vertex_color(vertex: &boxcraft_core::Vertex, sun_phase: f32) -> [f32; 4] {
-    let daylight = sunlight_daylight(sun_phase);
+fn terrain_vertex_color(vertex: &boxcraft_core::Vertex, daylight: f32) -> [f32; 4] {
     let sky = vertex.light.clamp(0.0, 1.0) * daylight;
     let torch = vertex.torch_light.clamp(0.0, 1.0);
     let ao = (0.68 + vertex.ambient_occlusion.clamp(0.0, 1.0) * 0.32).clamp(0.0, 1.0);
@@ -1608,6 +1723,22 @@ mod tests {
         assert!(dark_color[0] < 0.01);
         assert!(torch_color[0] > torch_color[1]);
         assert!(torch_color[0] > dark_color[0] + 0.4);
+    }
+
+    #[test]
+    fn sky_only_mesh_can_apply_daylight_as_a_draw_tint() {
+        let sky_lit = boxcraft_core::Vertex {
+            light: 0.83,
+            torch_light: 0.0,
+            ambient_occlusion: 0.72,
+            ..test_vertex()
+        };
+        let daylight = 0.31;
+        let baked_day = terrain_vertex_color(&sky_lit, 1.0);
+        let direct = terrain_vertex_color(&sky_lit, daylight);
+        for channel in 0..3 {
+            assert!((baked_day[channel] * daylight - direct[channel]).abs() < 1.0e-6);
+        }
     }
 
     fn test_vertex() -> boxcraft_core::Vertex {

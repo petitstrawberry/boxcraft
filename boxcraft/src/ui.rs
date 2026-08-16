@@ -29,7 +29,8 @@ const WORLD_SEED: u64 = 0xB0CA_FE00_2026_0001;
 const ATLAS_TILE_SIZE: u32 = 32;
 const ATLAS_COLUMNS: u32 = 4;
 const ATLAS_ROWS: u32 = 4;
-const DAY_LENGTH_SECONDS: f32 = 150.0;
+/// One complete sunrise-to-sunrise cycle, matching Minecraft's 20-minute day.
+const DAY_LENGTH_SECONDS: f32 = 1_200.0;
 const SUNLIGHT_UPDATES_PER_SECOND: f32 = 4.0;
 /// Keep both workers busy without allowing stale movement jobs to pile up.
 const MAX_IN_FLIGHT_NEAR_JOBS: usize = WORKER_COUNT * 2;
@@ -1819,25 +1820,23 @@ fn sunlight_daylight(sun_phase: f32) -> f32 {
     (sunlight_direction(sun_phase).y * 0.5 + 0.5).clamp(0.08, 1.0)
 }
 
-/// Return a horizon-aware sky clear color for the current day-cycle phase.
+/// Return a Rayleigh-inspired sky clear color for the current day-cycle phase.
 ///
 /// The canvas has no sky geometry, so changing its clear color gives the day
-/// cycle a sunrise, blue daytime, sunset, and deep night without adding any
-/// vertices or draw calls.
+/// cycle a continuous night, blue-hour, and daytime transition without adding
+/// any vertices or draw calls. The clear color intentionally represents the
+/// zenith-facing sky: a warm horizon color would tint the whole screen red or
+/// orange because this canvas has no vertical atmospheric gradient.
 fn sky_color(sun_phase: f32) -> Color {
-    let sun = sunlight_direction(sun_phase);
+    let sun_elevation = sunlight_direction(sun_phase).y;
     let night = Color::rgb_f32(0.008, 0.018, 0.055);
-    // Keep both horizons in a muted red-orange range. A single clear color has
-    // no vertical atmospheric gradient, so purple or yellow hues read as an
-    // artificial tint across the whole sky instead of a natural horizon glow.
-    let horizon = Color::rgb_f32(0.52, 0.19, 0.08);
+    let blue_hour = Color::rgb_f32(0.11, 0.19, 0.36);
     let day = Color::rgb_f32(0.35, 0.59, 0.86);
 
-    if sun.y <= 0.08 {
-        mix_color(night, horizon, smoothstep(-0.28, 0.08, sun.y))
-    } else {
-        mix_color(horizon, day, smoothstep(0.08, 0.58, sun.y))
-    }
+    let night_to_blue_hour = smoothstep(-0.34, -0.08, sun_elevation);
+    let blue_hour_to_day = smoothstep(-0.08, 0.36, sun_elevation);
+    let twilight = mix_color(night, blue_hour, night_to_blue_hour);
+    mix_color(twilight, day, blue_hour_to_day)
 }
 
 fn mix_color(from: Color, to: Color, amount: f32) -> Color {
@@ -2026,9 +2025,8 @@ mod tests {
         let sunset = sky_color(0.5);
         let night = sky_color(0.75);
 
-        assert!(sunrise.r > sunrise.b);
-        assert!(sunset.r > sunset.b);
-        assert!(sunset.g > sunset.b);
+        assert!(sunrise.b > sunrise.r);
+        assert!(sunset.b > sunset.r);
         assert!(day.b > day.r);
         assert!(day.b > night.b + 0.8);
         assert!(night.r < 0.02);

@@ -5,8 +5,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use boxcraft_core::{
-    Block, CHUNK_SIZE, Game, IVec3, LightUpdate, Mat4, PlayerInput, Vec3, VisibleSpace, mesh_chunk,
-    mesh_chunk_lod,
+    Block, CHUNK_SIZE, Game, IVec3, LightUpdate, Mat4, PlayerInput, Vec3, VisibleSpace, World,
+    mesh_chunk,
 };
 use scarlet_ui::prelude::*;
 use scarlet_ui::{
@@ -14,6 +14,8 @@ use scarlet_ui::{
     SgfxCanvas, SgfxCanvasDraw, SgfxCanvasFrame, SgfxCanvasHandle, SgfxCanvasVertex, SgfxMesh,
     SgfxMeshHandle, SgfxTexture, hstack, vstack, zstack,
 };
+
+use crate::mesh_worker::{FarMeshResult, MeshJob, MeshResult, MeshWorkers, WORKER_COUNT};
 
 const APP_ID: &str = "org.scarlet-os.boxcraft";
 const WINDOW_WIDTH: f32 = 1100.0;
@@ -28,8 +30,9 @@ const ATLAS_COLUMNS: u32 = 4;
 const ATLAS_ROWS: u32 = 4;
 const DAY_LENGTH_SECONDS: f32 = 150.0;
 const SUNLIGHT_UPDATES_PER_SECOND: f32 = 4.0;
-/// Terrain chunks built per idle tick while streaming the world in.
-const CHUNKS_PER_FRAME: usize = 3;
+/// Keep both workers busy without allowing stale movement jobs to pile up.
+const MAX_IN_FLIGHT_NEAR_JOBS: usize = WORKER_COUNT * 2;
+const MAX_MESH_RESULTS_PER_IDLE: usize = 2;
 /// Default and inclusive bounds for the configurable render distance.
 const DEFAULT_RENDER_DISTANCE: i32 = 3;
 const MIN_RENDER_DISTANCE: i32 = 1;
@@ -80,9 +83,14 @@ struct Runtime {
     sunlight_step: u64,
     build_queue: VecDeque<(i32, i32)>,
     queued_chunks: HashSet<(i32, i32)>,
+    in_flight_chunks: HashMap<(i32, i32), u64>,
+    next_mesh_job_id: u64,
+    terrain_revision: u64,
     player_chunk: (i32, i32),
     far_dirty: bool,
     far_chunks: Vec<(i32, i32)>,
+    far_generation: u64,
+    far_job_in_flight: Option<u64>,
 }
 
 impl Runtime {
@@ -96,9 +104,14 @@ impl Runtime {
             sunlight_step: 0,
             build_queue: VecDeque::new(),
             queued_chunks: HashSet::new(),
+            in_flight_chunks: HashMap::new(),
+            next_mesh_job_id: 0,
+            terrain_revision: 0,
             player_chunk: (i32::MAX, i32::MAX),
             far_dirty: false,
             far_chunks: Vec::new(),
+            far_generation: 0,
+            far_job_in_flight: None,
         }
     }
 }
@@ -132,8 +145,10 @@ struct BoxcraftApp {
     canvas_frame: State<Arc<SgfxCanvasFrame>>,
     near_core_meshes: State<Arc<HashMap<(i32, i32), Arc<boxcraft_core::Mesh>>>>,
     near_meshes: State<Arc<HashMap<(i32, i32), Arc<TerrainMesh>>>>,
+    presented_near_meshes: State<Arc<HashMap<(i32, i32), Arc<TerrainMesh>>>>,
     far_core_meshes: State<Arc<HashMap<(i32, i32), Arc<boxcraft_core::Mesh>>>>,
     far_meshes: State<Arc<HashMap<(i32, i32), Arc<TerrainMesh>>>>,
+    presented_far_meshes: State<Arc<HashMap<(i32, i32), Arc<TerrainMesh>>>>,
     mesh_revision: State<u64>,
     frame_revision: State<u64>,
     sun_phase: State<f32>,
@@ -148,20 +163,21 @@ struct BoxcraftApp {
     visible_space: Arc<Mutex<Option<Arc<VisibleSpace>>>>,
     block_atlas: Arc<SgfxTexture>,
     runtime: Arc<Mutex<Runtime>>,
+    mesh_world: Arc<Mutex<Arc<World>>>,
+    mesh_workers: MeshWorkers,
 }
 
 impl BoxcraftApp {
     fn new() -> Self {
+        let initial_game = Game::generated(WORLD_SEED);
+        let mesh_world = Arc::new(Mutex::new(Arc::new(initial_game.world.clone())));
         let initial_frame = Arc::new(
             SgfxCanvasFrame::new(0, sky_color(0.0))
                 .depth_tested()
                 .reference_aspect(REFERENCE_ASPECT),
         );
         let app = Self {
-            game: State::new(
-                StateId::new(1),
-                Arc::new(Mutex::new(Game::generated(WORLD_SEED))),
-            ),
+            game: State::new(StateId::new(1), Arc::new(Mutex::new(initial_game))),
             keys: State::new(StateId::new(2), PressedKeys::default()),
             seed: State::new(StateId::new(3), WORLD_SEED),
             pointer_lock_desired: State::new(StateId::new(4), false),
@@ -182,12 +198,20 @@ impl BoxcraftApp {
                 StateId::new(11),
                 Arc::new(HashMap::<(i32, i32), Arc<TerrainMesh>>::new()),
             ),
+            presented_near_meshes: State::new(
+                StateId::new(27),
+                Arc::new(HashMap::<(i32, i32), Arc<TerrainMesh>>::new()),
+            ),
             far_core_meshes: State::new(
                 StateId::new(26),
                 Arc::new(HashMap::<(i32, i32), Arc<boxcraft_core::Mesh>>::new()),
             ),
             far_meshes: State::new(
                 StateId::new(24),
+                Arc::new(HashMap::<(i32, i32), Arc<TerrainMesh>>::new()),
+            ),
+            presented_far_meshes: State::new(
+                StateId::new(28),
                 Arc::new(HashMap::<(i32, i32), Arc<TerrainMesh>>::new()),
             ),
             mesh_revision: State::new(StateId::new(12), 0),
@@ -207,6 +231,8 @@ impl BoxcraftApp {
             visible_space: Arc::new(Mutex::new(None)),
             block_atlas: block_texture_atlas(),
             runtime: Arc::new(Mutex::new(Runtime::new())),
+            mesh_world,
+            mesh_workers: MeshWorkers::new(),
         };
         app.refresh_chunk_set();
         app.update_hud();
@@ -221,6 +247,24 @@ impl BoxcraftApp {
             Err(poisoned) => poisoned.into_inner(),
         };
         operation(&mut guard)
+    }
+
+    /// Publish an immutable world revision for background mesh workers.
+    ///
+    /// The full copy only occurs after an actual block edit. Normal movement
+    /// and chunk streaming share this snapshot through `Arc` without copying
+    /// or holding the mutable game lock on worker threads.
+    fn refresh_mesh_world_snapshot(&self) {
+        let world = Arc::new(self.with_game(|game| game.world.clone()));
+        *self
+            .mesh_world
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = world;
+        let mut runtime = self
+            .runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        runtime.terrain_revision = runtime.terrain_revision.wrapping_add(1);
     }
 
     fn clear_pressed_keys(&self) {
@@ -261,7 +305,12 @@ impl BoxcraftApp {
     fn reset_world(&self) {
         self.seed.update(|seed| *seed = seed.wrapping_add(1));
         let seed = self.seed.get();
-        self.game.set(Arc::new(Mutex::new(Game::generated(seed))));
+        let game = Game::generated(seed);
+        *self
+            .mesh_world
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::new(game.world.clone());
+        self.game.set(Arc::new(Mutex::new(game)));
         self.clear_pressed_keys();
         let retired: Vec<SgfxMeshHandle> = {
             let mut handles = self
@@ -283,6 +332,8 @@ impl BoxcraftApp {
             .extend(retired.into_iter().chain(retired_far));
         self.near_meshes
             .update(|chunks| *chunks = Arc::new(HashMap::<(i32, i32), Arc<TerrainMesh>>::new()));
+        self.presented_near_meshes
+            .set(Arc::new(HashMap::<(i32, i32), Arc<TerrainMesh>>::new()));
         self.near_core_meshes.set(Arc::new(
             HashMap::<(i32, i32), Arc<boxcraft_core::Mesh>>::new(),
         ));
@@ -290,6 +341,8 @@ impl BoxcraftApp {
             HashMap::<(i32, i32), Arc<boxcraft_core::Mesh>>::new(),
         ));
         self.far_meshes
+            .set(Arc::new(HashMap::<(i32, i32), Arc<TerrainMesh>>::new()));
+        self.presented_far_meshes
             .set(Arc::new(HashMap::<(i32, i32), Arc<TerrainMesh>>::new()));
         *self
             .visible_space
@@ -302,9 +355,13 @@ impl BoxcraftApp {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             runtime.build_queue.clear();
             runtime.queued_chunks.clear();
+            runtime.in_flight_chunks.clear();
+            runtime.terrain_revision = runtime.terrain_revision.wrapping_add(1);
             runtime.player_chunk = (i32::MAX, i32::MAX);
             runtime.far_dirty = false;
             runtime.far_chunks.clear();
+            runtime.far_generation = runtime.far_generation.wrapping_add(1);
+            runtime.far_job_in_flight = None;
         }
         self.refresh_chunk_set();
         self.update_hud();
@@ -457,6 +514,7 @@ impl BoxcraftApp {
             MouseButton::Middle => None,
         });
         if let Some((position, light_update, topology_changed)) = edit {
+            self.refresh_mesh_world_snapshot();
             self.rebuild_edited_chunks(position, light_update, topology_changed);
         }
         true
@@ -535,10 +593,12 @@ impl BoxcraftApp {
             true
         };
         if far_dirty {
-            self.runtime
+            let mut runtime = self
+                .runtime
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .far_dirty = true;
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            runtime.far_dirty = true;
+            runtime.far_generation = runtime.far_generation.wrapping_add(1);
         }
         if rebuilt {
             self.refresh_frame_if_terrain_ready();
@@ -637,6 +697,7 @@ impl BoxcraftApp {
         if runtime.far_chunks != far {
             runtime.far_chunks = far;
             runtime.far_dirty = true;
+            runtime.far_generation = runtime.far_generation.wrapping_add(1);
             self.far_core_meshes.update(|meshes| {
                 let mut next = (**meshes).clone();
                 next.retain(|chunk, _| far_set.contains(chunk));
@@ -668,95 +729,186 @@ impl BoxcraftApp {
         changed
     }
 
-    /// Stream a few queued chunks into GPU meshes; returns whether any moved.
-    fn process_build_queue(&self, budget: usize) -> bool {
-        let mut built = false;
-        for _ in 0..budget {
-            let next = {
-                let mut runtime = self
-                    .runtime
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                loop {
-                    match runtime.build_queue.pop_front() {
-                        Some(chunk) => {
-                            runtime.queued_chunks.remove(&chunk);
-                            break Some(chunk);
-                        }
-                        None => break None,
-                    }
-                }
-            };
-            let Some(chunk) = next else { break };
-            built |= self.build_near_chunk(chunk.0, chunk.1);
-        }
-        built
-    }
-
-    /// Rebuild the retained far-ring meshes once streaming has settled.
-    ///
-    /// Deferred until the streaming queue settles so crossing a chunk border
-    /// rebuilds the ring once instead of once per incoming chunk.
-    fn rebuild_far_meshes_if_settled(&self) -> bool {
-        {
+    /// Fill the bounded worker queue with pending near chunks.
+    fn dispatch_near_mesh_jobs(&self) {
+        let world = Arc::clone(
+            &self
+                .mesh_world
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        let jobs = {
             let mut runtime = self
                 .runtime
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if !runtime.far_dirty || !runtime.build_queue.is_empty() {
-                return false;
+            let available = MAX_IN_FLIGHT_NEAR_JOBS.saturating_sub(runtime.in_flight_chunks.len());
+            let mut jobs = Vec::with_capacity(available);
+            for _ in 0..available {
+                let Some(chunk) = runtime.build_queue.pop_front() else {
+                    break;
+                };
+                if !runtime.queued_chunks.contains(&chunk) {
+                    continue;
+                }
+                runtime.next_mesh_job_id = runtime.next_mesh_job_id.wrapping_add(1);
+                let id = runtime.next_mesh_job_id;
+                let terrain_revision = runtime.terrain_revision;
+                runtime.in_flight_chunks.insert(chunk, id);
+                jobs.push(MeshJob::Near {
+                    id,
+                    terrain_revision,
+                    chunk,
+                    world: Arc::clone(&world),
+                });
             }
-            runtime.far_dirty = false;
+            jobs
+        };
+        for job in jobs {
+            self.mesh_workers.submit(job);
         }
-        let far_chunks: Vec<(i32, i32)> = self
-            .runtime
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .far_chunks
-            .clone();
-        let cached_core_meshes = self.far_core_meshes.get();
-        let mut core_meshes = HashMap::with_capacity(far_chunks.len());
-        let mut groups: HashMap<(i32, i32), Vec<Arc<boxcraft_core::Mesh>>> = HashMap::new();
-        let mut meshes = HashMap::with_capacity(far_chunks.len());
-        let game_state = self.game.get();
-        let game = game_state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let visible_space = {
-            let mut cached = self
-                .visible_space
+    }
+
+    /// Start one far-ring rebuild after all incoming near chunks are complete.
+    fn dispatch_far_mesh_job_if_settled(&self) {
+        let request = {
+            let mut runtime = self
+                .runtime
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            Arc::clone(cached.get_or_insert_with(|| {
-                let camera = game.player.camera().position;
-                let viewer = IVec3::new(
-                    camera.x.floor() as i32,
-                    camera.y.floor() as i32,
-                    camera.z.floor() as i32,
-                );
-                Arc::new(VisibleSpace::from_world(&game.world, viewer))
-            }))
+            if !runtime.far_dirty
+                || !runtime.build_queue.is_empty()
+                || !runtime.in_flight_chunks.is_empty()
+                || runtime.far_job_in_flight.is_some()
+            {
+                return;
+            }
+            runtime.next_mesh_job_id = runtime.next_mesh_job_id.wrapping_add(1);
+            let id = runtime.next_mesh_job_id;
+            runtime.far_job_in_flight = Some(id);
+            (
+                id,
+                runtime.terrain_revision,
+                runtime.far_generation,
+                runtime.far_chunks.clone(),
+            )
         };
+        let camera = self.with_game(|game| game.player.camera().position);
+        let viewer = IVec3::new(
+            camera.x.floor() as i32,
+            camera.y.floor() as i32,
+            camera.z.floor() as i32,
+        );
+        let world = Arc::clone(
+            &self
+                .mesh_world
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        let visible_space = self
+            .visible_space
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        self.mesh_workers.submit(MeshJob::Far {
+            id: request.0,
+            terrain_revision: request.1,
+            far_generation: request.2,
+            chunks: request.3,
+            world,
+            viewer,
+            visible_space,
+            cached_meshes: self.far_core_meshes.get(),
+        });
+    }
+
+    /// Apply completed CPU meshes on the UI thread and discard stale jobs.
+    fn process_mesh_results(&self) -> bool {
+        let mut changed = false;
+        for _ in 0..MAX_MESH_RESULTS_PER_IDLE {
+            let Some(result) = self.mesh_workers.try_recv() else {
+                break;
+            };
+            match result {
+                MeshResult::Near(result) => {
+                    let accepted = {
+                        let mut runtime = self
+                            .runtime
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        let current = runtime.in_flight_chunks.get(&result.chunk).copied();
+                        if current != Some(result.id) {
+                            false
+                        } else {
+                            runtime.in_flight_chunks.remove(&result.chunk);
+                            runtime.queued_chunks.remove(&result.chunk);
+                            result.terrain_revision == runtime.terrain_revision
+                                && chunk_within_near_radius(
+                                    result.chunk,
+                                    runtime.player_chunk,
+                                    self.render_distance.get(),
+                                )
+                        }
+                    };
+                    if accepted {
+                        self.near_core_meshes.update(|chunks| {
+                            let mut next = (**chunks).clone();
+                            next.insert(result.chunk, Arc::clone(&result.mesh));
+                            *chunks = Arc::new(next);
+                        });
+                        changed |= self.update_near_mesh_from_core(result.chunk, &result.mesh);
+                    }
+                }
+                MeshResult::Far(result) => {
+                    let accepted = {
+                        let mut runtime = self
+                            .runtime
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        if runtime.far_job_in_flight != Some(result.id) {
+                            false
+                        } else {
+                            runtime.far_job_in_flight = None;
+                            result.terrain_revision == runtime.terrain_revision
+                                && result.far_generation == runtime.far_generation
+                                && result.chunks == runtime.far_chunks
+                                && runtime.build_queue.is_empty()
+                                && runtime.in_flight_chunks.is_empty()
+                        }
+                    };
+                    if accepted {
+                        self.install_far_mesh_result(result);
+                        self.runtime
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .far_dirty = false;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        changed
+    }
+
+    fn install_far_mesh_result(&self, result: FarMeshResult) {
+        *self
+            .visible_space
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(Arc::clone(&result.visible_space));
+        let core_meshes = result.meshes;
+        let mut groups: HashMap<(i32, i32), Vec<Arc<boxcraft_core::Mesh>>> = HashMap::new();
+        for (chunk, core_mesh) in &core_meshes {
+            let group = (
+                chunk.0.div_euclid(FAR_MESH_GROUP_SIZE),
+                chunk.1.div_euclid(FAR_MESH_GROUP_SIZE),
+            );
+            groups.entry(group).or_default().push(Arc::clone(core_mesh));
+        }
+        let mut meshes = HashMap::with_capacity(groups.len());
         self.mesh_revision
             .update(|revision| *revision = revision.wrapping_add(1));
         let revision = self.mesh_revision.get();
-        for (chunk_x, chunk_z) in far_chunks.iter().copied() {
-            let key = (chunk_x, chunk_z);
-            let core_mesh = cached_core_meshes.get(&key).cloned().unwrap_or_else(|| {
-                Arc::new(mesh_chunk_lod(
-                    &game.world,
-                    chunk_x,
-                    chunk_z,
-                    &visible_space,
-                ))
-            });
-            core_meshes.insert(key, Arc::clone(&core_mesh));
-            let group = (
-                chunk_x.div_euclid(FAR_MESH_GROUP_SIZE),
-                chunk_z.div_euclid(FAR_MESH_GROUP_SIZE),
-            );
-            groups.entry(group).or_default().push(core_mesh);
-        }
         for (group, core_meshes) in groups {
             let has_block_light = core_meshes
                 .iter()
@@ -830,7 +982,6 @@ impl BoxcraftApp {
                 .extend(retired);
         }
         self.far_meshes.set(Arc::new(meshes));
-        true
     }
 
     /// Keep the last complete canvas frame visible during a far-ring handoff.
@@ -840,24 +991,22 @@ impl BoxcraftApp {
     /// would either expose holes or overlap the retained far LOD. Waiting only
     /// affects presentation; chunk meshing still advances every idle tick.
     fn terrain_handoff_pending(&self) -> bool {
-        let (far_dirty, chunks_pending) = {
-            let runtime = self
-                .runtime
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            (runtime.far_dirty, !runtime.build_queue.is_empty())
-        };
-        should_hold_previous_terrain_frame(
-            far_dirty,
-            chunks_pending,
-            !self.far_meshes.get().is_empty(),
-        )
+        let far_dirty = self
+            .runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .far_dirty;
+        should_hold_presented_terrain(far_dirty, !self.presented_far_meshes.get().is_empty())
     }
 
     fn refresh_frame_if_terrain_ready(&self) {
         if !self.terrain_handoff_pending() {
-            self.refresh_frame();
+            self.presented_near_meshes.set(self.near_meshes.get());
+            self.presented_far_meshes.set(self.far_meshes.get());
         }
+        // Even while workers prepare the next terrain snapshot, keep camera
+        // motion smooth by redrawing the last complete snapshot.
+        self.refresh_frame();
     }
 
     /// Build one chunk's retained SGFX meshes from the live world snapshot.
@@ -1004,7 +1153,7 @@ impl BoxcraftApp {
             // The SGFX renderer corrects this reference perspective as its canvas resizes.
             .reference_aspect(REFERENCE_ASPECT);
         let daylight = sunlight_daylight(sun_phase);
-        let far_meshes = self.far_meshes.get();
+        let far_meshes = self.presented_far_meshes.get();
         for (_, mesh) in far_meshes.iter().filter(|(chunk, mesh)| {
             mesh.triangle_count() > 0
                 && chunk_is_visible(
@@ -1026,7 +1175,7 @@ impl BoxcraftApp {
                     .texture(Arc::clone(&self.block_atlas)),
             );
         }
-        let near_meshes = self.near_meshes.get();
+        let near_meshes = self.presented_near_meshes.get();
         for (_, meshes) in near_meshes.iter().filter(|(chunk, mesh)| {
             mesh.triangle_count() > 0
                 && chunk_is_visible(
@@ -1292,9 +1441,10 @@ impl Application for BoxcraftApp {
             frame_changed |= self.rebuild_lighting_meshes();
         }
         // Stream terrain chunks around the player and drop distant ones.
+        frame_changed |= self.process_mesh_results();
         frame_changed |= self.refresh_chunk_set();
-        frame_changed |= self.process_build_queue(CHUNKS_PER_FRAME);
-        frame_changed |= self.rebuild_far_meshes_if_settled();
+        self.dispatch_near_mesh_jobs();
+        self.dispatch_far_mesh_job_if_settled();
         if frame_changed {
             self.refresh_frame_if_terrain_ready();
         }
@@ -1700,12 +1850,17 @@ fn insert_chunks_for_voxel_bounds(
     }
 }
 
-fn should_hold_previous_terrain_frame(
-    far_dirty: bool,
-    chunks_pending: bool,
-    has_presented_far_ring: bool,
+fn chunk_within_near_radius(
+    chunk: (i32, i32),
+    player_chunk: (i32, i32),
+    render_distance: i32,
 ) -> bool {
-    far_dirty && chunks_pending && has_presented_far_ring
+    let radius = render_distance.min(NEAR_CHUNK_RADIUS);
+    (chunk.0 - player_chunk.0).abs() <= radius && (chunk.1 - player_chunk.1).abs() <= radius
+}
+
+fn should_hold_presented_terrain(far_dirty: bool, has_presented_far_ring: bool) -> bool {
+    far_dirty && has_presented_far_ring
 }
 
 /// Return whether a horizontal chunk can intersect the camera's view cone.
@@ -1752,11 +1907,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn completed_far_ring_stays_presented_until_incoming_near_chunks_are_ready() {
-        assert!(should_hold_previous_terrain_frame(true, true, true));
-        assert!(!should_hold_previous_terrain_frame(true, false, true));
-        assert!(!should_hold_previous_terrain_frame(false, true, true));
-        assert!(!should_hold_previous_terrain_frame(true, true, false));
+    fn completed_far_ring_stays_presented_until_the_replacement_is_ready() {
+        assert!(should_hold_presented_terrain(true, true));
+        assert!(!should_hold_presented_terrain(false, true));
+        assert!(!should_hold_presented_terrain(true, false));
+    }
+
+    #[test]
+    fn near_radius_rejects_stale_worker_results_after_movement() {
+        assert!(chunk_within_near_radius((8, 7), (6, 6), 3));
+        assert!(!chunk_within_near_radius((9, 7), (6, 6), 3));
     }
 
     #[test]

@@ -1,5 +1,8 @@
 //! Boxcraft application entry point.
 
+#[cfg(any(target_os = "scarlet", test))]
+mod mesh_worker;
+
 #[cfg(target_os = "scarlet")]
 mod ui;
 

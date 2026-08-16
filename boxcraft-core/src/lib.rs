@@ -4,7 +4,7 @@
 //! graphics APIs, audio, or input backends.  A renderer can consume [`Mesh`] and
 //! [`Camera`], while an application converts its input state into [`PlayerInput`].
 
-use core::ops::{Add, AddAssign, Mul, Sub, SubAssign};
+use core::ops::{Add, AddAssign, Index, IndexMut, Mul, Sub, SubAssign};
 use std::sync::Arc;
 
 /// A three-dimensional floating-point vector.
@@ -439,17 +439,80 @@ pub const DEFAULT_WORLD_DEPTH: usize = 384;
 /// Horizontal size of one renderable terrain chunk, in voxels.
 pub const CHUNK_SIZE: i32 = 16;
 
+/// Copy-on-write storage for dense voxel and lighting arrays.
+///
+/// A world snapshot is handed to mesh workers for every edit. Keeping one
+/// `Vec` per field made that snapshot clone all 14 million cells even though a
+/// block edit touches only a small light volume. Pages preserve the dense
+/// indexing used by the mesher while cloning only pages that are actually
+/// written by the edit.
+#[derive(Clone, Debug, PartialEq)]
+struct PagedVec<T> {
+    pages: Vec<Arc<Vec<T>>>,
+    len: usize,
+}
+
+const STORAGE_PAGE_SIZE: usize = 4096;
+
+impl<T: Clone> PagedVec<T> {
+    fn filled(len: usize, value: T) -> Self {
+        let page_count = len.div_ceil(STORAGE_PAGE_SIZE);
+        let pages = (0..page_count)
+            .map(|page| {
+                let start = page * STORAGE_PAGE_SIZE;
+                let page_len = (len - start).min(STORAGE_PAGE_SIZE);
+                Arc::new(vec![value.clone(); page_len])
+            })
+            .collect();
+        Self { pages, len }
+    }
+
+    fn iter_mut(&mut self) -> impl Iterator<Item = &mut T> {
+        self.pages
+            .iter_mut()
+            .flat_map(|page| Arc::make_mut(page).iter_mut())
+    }
+}
+
+impl<T> PagedVec<T> {
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &T> {
+        self.pages.iter().flat_map(|page| page.iter())
+    }
+}
+
+impl<T> Index<usize> for PagedVec<T> {
+    type Output = T;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        let page = index / STORAGE_PAGE_SIZE;
+        let offset = index % STORAGE_PAGE_SIZE;
+        &self.pages[page][offset]
+    }
+}
+
+impl<T: Clone> IndexMut<usize> for PagedVec<T> {
+    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
+        let page = index / STORAGE_PAGE_SIZE;
+        let offset = index % STORAGE_PAGE_SIZE;
+        &mut Arc::make_mut(&mut self.pages[page])[offset]
+    }
+}
+
 /// A finite, densely stored voxel world.
 #[derive(Clone, Debug, PartialEq)]
 pub struct World {
     width: usize,
     height: usize,
     depth: usize,
-    blocks: Vec<Block>,
-    direct_sunlight: Vec<u8>,
-    sunlight: Vec<u8>,
-    block_light: Vec<u8>,
-    light_queue_pending: Vec<u8>,
+    blocks: PagedVec<Block>,
+    direct_sunlight: PagedVec<u8>,
+    sunlight: PagedVec<u8>,
+    block_light: PagedVec<u8>,
+    light_queue_pending: PagedVec<u8>,
     lighting_initialized: bool,
 }
 
@@ -460,6 +523,66 @@ pub struct LightUpdate {
     max_x: i32,
     min_z: i32,
     max_z: i32,
+}
+
+/// Maximum distance at which one edited cell can change propagated light.
+///
+/// Air still consumes one light level per propagated cell, so sky light can
+/// affect at most 15 cells from a changed source and torch light at most 14.
+/// The shared value keeps the incremental solver conservative while preventing
+/// a local edit from walking an unrelated world-sized region.
+const LIGHT_PROPAGATION_RADIUS: i32 = 15;
+
+#[derive(Clone, Copy, Debug)]
+struct LightBounds {
+    min_x: i32,
+    max_x: i32,
+    min_y: i32,
+    max_y: i32,
+    min_z: i32,
+    max_z: i32,
+}
+
+impl LightBounds {
+    fn around(center: IVec3) -> Self {
+        Self {
+            min_x: center.x,
+            max_x: center.x,
+            min_y: center.y,
+            max_y: center.y,
+            min_z: center.z,
+            max_z: center.z,
+        }
+    }
+
+    fn include(&mut self, position: IVec3) {
+        self.min_x = self.min_x.min(position.x);
+        self.max_x = self.max_x.max(position.x);
+        self.min_y = self.min_y.min(position.y);
+        self.max_y = self.max_y.max(position.y);
+        self.min_z = self.min_z.min(position.z);
+        self.max_z = self.max_z.max(position.z);
+    }
+
+    fn expanded(self, radius: i32) -> Self {
+        Self {
+            min_x: self.min_x.saturating_sub(radius),
+            max_x: self.max_x.saturating_add(radius),
+            min_y: self.min_y.saturating_sub(radius),
+            max_y: self.max_y.saturating_add(radius),
+            min_z: self.min_z.saturating_sub(radius),
+            max_z: self.max_z.saturating_add(radius),
+        }
+    }
+
+    fn contains(self, position: IVec3) -> bool {
+        position.x >= self.min_x
+            && position.x <= self.max_x
+            && position.y >= self.min_y
+            && position.y <= self.max_y
+            && position.z >= self.min_z
+            && position.z <= self.max_z
+    }
 }
 
 impl LightUpdate {
@@ -629,11 +752,11 @@ impl World {
             width,
             height,
             depth,
-            blocks: vec![Block::Air; cells],
-            direct_sunlight: vec![0; cells],
-            sunlight: vec![0; cells],
-            block_light: vec![0; cells],
-            light_queue_pending: vec![0; cells],
+            blocks: PagedVec::filled(cells, Block::Air),
+            direct_sunlight: PagedVec::filled(cells, 0),
+            sunlight: PagedVec::filled(cells, 0),
+            block_light: PagedVec::filled(cells, 0),
+            light_queue_pending: PagedVec::filled(cells, 0),
             lighting_initialized: false,
         }
     }
@@ -919,8 +1042,8 @@ impl World {
     /// # Arguments
     ///
     /// * `center` - Edited voxel around which light is refreshed.
-    /// * `radius` - Retained for API compatibility; propagation now continues
-    ///   until no light value changes and is not clipped to a fixed radius.
+    /// * `radius` - Retained for API compatibility. The solver uses the light
+    ///   level's physical attenuation bound instead of trusting this hint.
     ///
     /// # Returns
     ///
@@ -947,12 +1070,15 @@ impl World {
 
         let mut changed = LightUpdate::empty();
         let mut queue = std::collections::VecDeque::new();
-        self.refresh_direct_sunlight_after_edit(center, &mut queue);
+        let mut sunlight_source_bounds = LightBounds::around(center);
+        self.refresh_direct_sunlight_after_edit(center, &mut queue, &mut sunlight_source_bounds);
+        let sunlight_bounds = sunlight_source_bounds.expanded(LIGHT_PROPAGATION_RADIUS);
         Self::enqueue_light(&mut queue, &mut self.light_queue_pending, center_index);
-        self.relax_sunlight(&mut queue, &mut changed);
+        self.relax_sunlight(&mut queue, &mut changed, sunlight_bounds);
 
+        let block_light_bounds = LightBounds::around(center).expanded(LIGHT_PROPAGATION_RADIUS);
         Self::enqueue_light(&mut queue, &mut self.light_queue_pending, center_index);
-        self.relax_block_light(&mut queue, &mut changed);
+        self.relax_block_light(&mut queue, &mut changed, block_light_bounds);
         debug_assert!(self.light_queue_pending.iter().all(|pending| *pending == 0));
         changed
     }
@@ -961,6 +1087,7 @@ impl World {
         &mut self,
         center: IVec3,
         queue: &mut std::collections::VecDeque<usize>,
+        changed_bounds: &mut LightBounds,
     ) {
         // Direct sky only travels down a column. Everything above the edit is
         // unchanged, so resume from the cached value immediately above it and
@@ -984,6 +1111,7 @@ impl World {
                 break;
             }
             self.direct_sunlight[index] = level;
+            changed_bounds.include(position);
             Self::enqueue_light(queue, &mut self.light_queue_pending, index);
         }
     }
@@ -992,6 +1120,7 @@ impl World {
         &mut self,
         queue: &mut std::collections::VecDeque<usize>,
         changed: &mut LightUpdate,
+        bounds: LightBounds,
     ) {
         while let Some(index) = queue.pop_front() {
             self.light_queue_pending[index] = 0;
@@ -1010,7 +1139,11 @@ impl World {
                 IVec3::new(0, 0, -1),
                 IVec3::new(0, 0, 1),
             ] {
-                let Some(neighbor) = self.index(position + offset) else {
+                let neighbor_position = position + offset;
+                if !bounds.contains(neighbor_position) {
+                    continue;
+                }
+                let Some(neighbor) = self.index(neighbor_position) else {
                     continue;
                 };
                 Self::enqueue_light(queue, &mut self.light_queue_pending, neighbor);
@@ -1022,6 +1155,7 @@ impl World {
         &mut self,
         queue: &mut std::collections::VecDeque<usize>,
         changed: &mut LightUpdate,
+        bounds: LightBounds,
     ) {
         while let Some(index) = queue.pop_front() {
             self.light_queue_pending[index] = 0;
@@ -1040,7 +1174,11 @@ impl World {
                 IVec3::new(0, 0, -1),
                 IVec3::new(0, 0, 1),
             ] {
-                let Some(neighbor) = self.index(position + offset) else {
+                let neighbor_position = position + offset;
+                if !bounds.contains(neighbor_position) {
+                    continue;
+                }
+                let Some(neighbor) = self.index(neighbor_position) else {
                     continue;
                 };
                 Self::enqueue_light(queue, &mut self.light_queue_pending, neighbor);
@@ -1090,7 +1228,7 @@ impl World {
 
     fn enqueue_light(
         queue: &mut std::collections::VecDeque<usize>,
-        pending: &mut [u8],
+        pending: &mut PagedVec<u8>,
         index: usize,
     ) {
         if pending[index] == 0 {
@@ -2398,6 +2536,8 @@ fn initial_t(origin: f32, direction: f32, step: i32) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::{
         Block, CHUNK_SIZE, DEFAULT_WORLD_DEPTH, DEFAULT_WORLD_HEIGHT, DEFAULT_WORLD_WIDTH, IVec3,
         Mat4, Mesh, Player, PlayerInput, SEA_LEVEL, Vec3, VisibleSpace, World, mesh_chunk,
@@ -2511,6 +2651,42 @@ mod tests {
             "3D cave noise should carve tunnels"
         );
         assert!(snow > 0, "peaks above the snow line should be snowy");
+    }
+
+    #[test]
+    fn edited_world_snapshots_share_unmodified_storage_pages() {
+        let mut world = World::new(128, 32, 128);
+        world.recompute_light();
+        let mut edited = world.clone();
+
+        assert!(Arc::ptr_eq(&world.blocks.pages[0], &edited.blocks.pages[0]));
+        assert!(Arc::ptr_eq(
+            &world.sunlight.pages[0],
+            &edited.sunlight.pages[0]
+        ));
+
+        let position = IVec3::new(4, 4, 4);
+        edited.set(position, Block::Torch);
+        edited.recompute_light_after_edit(position);
+
+        assert_eq!(edited.block(position), Some(Block::Torch));
+        assert_eq!(world.block(position), Some(Block::Air));
+        assert!(
+            edited
+                .blocks
+                .pages
+                .iter()
+                .zip(&world.blocks.pages)
+                .any(|(edited, original)| Arc::ptr_eq(edited, original))
+        );
+        assert!(
+            edited
+                .sunlight
+                .pages
+                .iter()
+                .zip(&world.sunlight.pages)
+                .any(|(edited, original)| Arc::ptr_eq(edited, original))
+        );
     }
 
     #[test]

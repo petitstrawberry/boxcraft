@@ -1317,24 +1317,9 @@ impl BoxcraftApp {
         .on_mouse_delta(move |dx, dy| pointer_delta.handle_mouse_delta(dx, dy))
         .on_mouse_button(move |button, pressed| canvas_input.handle_mouse_button(button, pressed));
 
-        let pointer_help = if pointer_locked {
-            String::from("Esc to release · Left break · Right place · WASD + Space to move")
-        } else {
-            String::from("Click to capture pointer · O settings · +/- render distance")
-        };
         vstack! {
             header,
             game_area,
-            hstack! {
-                Text::from_state(self.selected_block.clone()).font_size(13.0),
-                Spacer::new(),
-                Text::new(pointer_help).font_size(12.0),
-                Spacer::new(),
-                Text::from_state(self.status.clone()).font_size(12.0),
-            }
-            .spacing(10.0)
-            .padding(10.0)
-            .background(Color::rgb(0.03, 0.04, 0.07)),
         }
         .frame(f32::INFINITY, f32::INFINITY)
         .on_key(move |event| key_input.handle_key(event))

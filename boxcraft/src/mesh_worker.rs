@@ -4,7 +4,9 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
-use boxcraft_core::{IVec3, Mesh, VisibleSpace, World, mesh_chunk, mesh_chunk_lod};
+use boxcraft_core::{
+    Block, IVec3, LightUpdate, Mesh, VisibleSpace, World, mesh_chunk, mesh_chunk_lod,
+};
 
 /// Two workers leave the UI and SGFX submission path on their own thread while
 /// still providing useful parallelism to a Scarlet guest launched with SMP.
@@ -27,6 +29,14 @@ pub enum MeshJob {
         visible_space: Option<Arc<VisibleSpace>>,
         cached_meshes: Arc<HashMap<(i32, i32), Arc<Mesh>>>,
     },
+    Edit {
+        id: u64,
+        terrain_revision: u64,
+        world: Arc<World>,
+        position: IVec3,
+        block: Block,
+        topology_changed: bool,
+    },
 }
 
 pub struct NearMeshResult {
@@ -45,9 +55,19 @@ pub struct FarMeshResult {
     pub meshes: HashMap<(i32, i32), Arc<Mesh>>,
 }
 
+pub struct EditMeshResult {
+    pub id: u64,
+    pub terrain_revision: u64,
+    pub world: Arc<World>,
+    pub position: IVec3,
+    pub light_update: LightUpdate,
+    pub topology_changed: bool,
+}
+
 pub enum MeshResult {
     Near(NearMeshResult),
     Far(FarMeshResult),
+    Edit(EditMeshResult),
 }
 
 struct Shared {
@@ -84,6 +104,26 @@ impl MeshWorkers {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .push_back(job);
         self.shared.wake_workers.notify_one();
+    }
+
+    /// Put an edit ahead of queued streaming work and discard queued jobs for
+    /// the old world snapshot. Jobs already executing are harmless: their
+    /// revision is rejected when the UI thread receives their result.
+    pub fn submit_edit(&self, job: MeshJob) {
+        let mut jobs = self
+            .shared
+            .jobs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        jobs.retain(|queued| matches!(queued, MeshJob::Edit { .. }));
+        jobs.push_front(job);
+        drop(jobs);
+        self.shared
+            .results
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        self.shared.wake_workers.notify_all();
     }
 
     pub fn try_recv(&self) -> Option<MeshResult> {
@@ -160,6 +200,26 @@ fn run_job(job: MeshJob) -> MeshResult {
                 meshes,
             })
         }
+        MeshJob::Edit {
+            id,
+            terrain_revision,
+            world,
+            position,
+            block,
+            topology_changed,
+        } => {
+            let mut next_world = (*world).clone();
+            let _ = next_world.set(position, block);
+            let light_update = next_world.recompute_light_after_edit(position);
+            MeshResult::Edit(EditMeshResult {
+                id,
+                terrain_revision,
+                world: Arc::new(next_world),
+                position,
+                light_update,
+                topology_changed,
+            })
+        }
     }
 }
 
@@ -221,6 +281,38 @@ mod tests {
                 break;
             }
             assert!(Instant::now() < deadline, "far mesh worker timed out");
+            thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn worker_applies_edit_and_recomputes_light_off_thread() {
+        let workers = MeshWorkers::new();
+        let mut world = World::new(8, 8, 8);
+        let position = IVec3::new(3, 3, 3);
+        world.set(position, Block::Stone);
+        world.recompute_light();
+        workers.submit_edit(MeshJob::Edit {
+            id: 61,
+            terrain_revision: 14,
+            world: Arc::new(world),
+            position,
+            block: Block::Air,
+            topology_changed: true,
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(MeshResult::Edit(result)) = workers.try_recv() {
+                assert_eq!(result.id, 61);
+                assert_eq!(result.terrain_revision, 14);
+                assert_eq!(result.position, position);
+                assert_eq!(result.world.block(position), Some(Block::Air));
+                assert!(result.topology_changed);
+                assert!(result.light_update.horizontal_bounds().is_some());
+                break;
+            }
+            assert!(Instant::now() < deadline, "edit worker timed out");
             thread::yield_now();
         }
     }

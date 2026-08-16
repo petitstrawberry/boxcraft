@@ -5,6 +5,7 @@
 //! [`Camera`], while an application converts its input state into [`PlayerInput`].
 
 use core::ops::{Add, AddAssign, Mul, Sub, SubAssign};
+use std::sync::Arc;
 
 /// A three-dimensional floating-point vector.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -2028,12 +2029,12 @@ impl Player {
             .map(|(position, _)| position)
     }
 
-    /// Place the selected block and return the exact changed-light extent.
-    pub fn place_block_with_light_update(
-        &self,
-        world: &mut World,
-        reach: f32,
-    ) -> Option<(IVec3, LightUpdate)> {
+    /// Returns the air cell that would receive the selected block.
+    ///
+    /// This is the read-only half of [`Player::place_block_with_light_update`].
+    /// Frontends can resolve a placement request against an immutable world
+    /// snapshot and perform the actual edit on a worker-owned clone.
+    pub fn placement_target(&self, world: &World, reach: f32) -> Option<IVec3> {
         if !self.selected_block.is_placeable() {
             return None;
         }
@@ -2044,6 +2045,16 @@ impl Player {
         {
             return None;
         }
+        Some(target)
+    }
+
+    /// Place the selected block and return the exact changed-light extent.
+    pub fn place_block_with_light_update(
+        &self,
+        world: &mut World,
+        reach: f32,
+    ) -> Option<(IVec3, LightUpdate)> {
+        let target = self.placement_target(world, reach)?;
         if world.set(target, self.selected_block) {
             let light_update = world.recompute_light_after_edit(target);
             Some((target, light_update))
@@ -2128,8 +2139,8 @@ impl Player {
 /// A convenience bundle for the world and its sole player.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Game {
-    /// Mutable generated voxel world.
-    pub world: World,
+    /// Shared immutable voxel world snapshot.
+    pub world: Arc<World>,
     /// The controllable player.
     pub player: Player,
 }
@@ -2145,7 +2156,7 @@ impl Game {
     ///
     /// A generated world and its correctly positioned starting player.
     pub fn generated(seed: u64) -> Self {
-        let world = World::generate(seed);
+        let world = Arc::new(World::generate(seed));
         let player = Player::new(world.spawn_point());
         Self { world, player }
     }

@@ -9,8 +9,8 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use scarlet_sys::{Syscall, syscall3};
 
 use boxcraft_core::{
-    Block, CHUNK_SIZE, Game, IVec3, LightUpdate, Mat4, PlayerInput, Vec3, VisibleSpace, World,
-    mesh_chunk,
+    Block, CHUNK_SIZE, DEFAULT_WORLD_HEIGHT, Game, IVec3, LightUpdate, Mat4, PlayerInput, Vec3,
+    VisibleSpace, World,
 };
 use scarlet_ui::prelude::*;
 use scarlet_ui::{
@@ -97,6 +97,7 @@ struct Runtime {
     far_chunks: Vec<(i32, i32)>,
     far_generation: u64,
     far_job_in_flight: Option<u64>,
+    edit_job_in_flight: Option<u64>,
 }
 
 impl Runtime {
@@ -118,6 +119,48 @@ impl Runtime {
             far_chunks: Vec::new(),
             far_generation: 0,
             far_job_in_flight: None,
+            edit_job_in_flight: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct EditRequest {
+    position: IVec3,
+    block: Block,
+    topology_changed: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MeshBounds {
+    min: Vec3,
+    max: Vec3,
+}
+
+impl MeshBounds {
+    fn fallback(origin_x: i32, origin_z: i32, span: i32) -> Self {
+        let min_x = origin_x as f32 * CHUNK_SIZE as f32;
+        let min_z = origin_z as f32 * CHUNK_SIZE as f32;
+        let max_x = (origin_x + span) as f32 * CHUNK_SIZE as f32;
+        let max_z = (origin_z + span) as f32 * CHUNK_SIZE as f32;
+        Self {
+            min: Vec3::new(min_x, 0.0, min_z),
+            max: Vec3::new(max_x, DEFAULT_WORLD_HEIGHT as f32, max_z),
+        }
+    }
+
+    fn union(self, other: Self) -> Self {
+        Self {
+            min: Vec3::new(
+                self.min.x.min(other.min.x),
+                self.min.y.min(other.min.y),
+                self.min.z.min(other.min.z),
+            ),
+            max: Vec3::new(
+                self.max.x.max(other.max.x),
+                self.max.y.max(other.max.y),
+                self.max.z.max(other.max.z),
+            ),
         }
     }
 }
@@ -126,6 +169,7 @@ impl Runtime {
 struct TerrainMesh {
     gpu: Arc<SgfxMesh>,
     has_block_light: bool,
+    bounds: MeshBounds,
 }
 
 impl TerrainMesh {
@@ -179,7 +223,7 @@ impl BoxcraftApp {
     fn new() -> Self {
         let seed = random_world_seed();
         let initial_game = Game::generated(seed);
-        let mesh_world = Arc::new(Mutex::new(Arc::new(initial_game.world.clone())));
+        let mesh_world = Arc::new(Mutex::new(Arc::clone(&initial_game.world)));
         let initial_frame = Arc::new(
             SgfxCanvasFrame::new(0, sky_color(0.0))
                 .depth_tested()
@@ -260,24 +304,6 @@ impl BoxcraftApp {
         operation(&mut guard)
     }
 
-    /// Publish an immutable world revision for background mesh workers.
-    ///
-    /// The full copy only occurs after an actual block edit. Normal movement
-    /// and chunk streaming share this snapshot through `Arc` without copying
-    /// or holding the mutable game lock on worker threads.
-    fn refresh_mesh_world_snapshot(&self) {
-        let world = Arc::new(self.with_game(|game| game.world.clone()));
-        *self
-            .mesh_world
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = world;
-        let mut runtime = self
-            .runtime
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        runtime.terrain_revision = runtime.terrain_revision.wrapping_add(1);
-    }
-
     fn clear_pressed_keys(&self) {
         self.keys.set(PressedKeys::default());
     }
@@ -333,7 +359,7 @@ impl BoxcraftApp {
         *self
             .mesh_world
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::new(game.world.clone());
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::clone(&game.world);
         self.game.set(Arc::new(Mutex::new(game)));
         self.clear_pressed_keys();
         self.clear_pending_mouse_delta();
@@ -387,6 +413,7 @@ impl BoxcraftApp {
             runtime.far_chunks.clear();
             runtime.far_generation = runtime.far_generation.wrapping_add(1);
             runtime.far_job_in_flight = None;
+            runtime.edit_job_in_flight = None;
         }
         self.refresh_chunk_set();
         self.update_hud();
@@ -526,31 +553,71 @@ impl BoxcraftApp {
             return true;
         }
 
-        let edit = self.with_game(|game| match button {
+        let request = self.with_game(|game| match button {
             MouseButton::Left => {
                 let hit = game.world.raycast(
                     game.player.camera().position,
                     game.player.camera().forward(),
                     REACH,
                 )?;
-                let topology_changed = game.world.block(hit.position).is_some_and(Block::occludes);
-                game.player
-                    .break_block_with_light_update(&mut game.world, REACH)
-                    .map(|(hit, light)| (hit.position, light, topology_changed))
+                Some(EditRequest {
+                    position: hit.position,
+                    block: Block::Air,
+                    topology_changed: game.world.block(hit.position).is_some_and(Block::occludes),
+                })
             }
             MouseButton::Right => {
-                let topology_changed = game.player.selected_block.occludes();
-                game.player
-                    .place_block_with_light_update(&mut game.world, REACH)
-                    .map(|(position, light)| (position, light, topology_changed))
+                let position = game.player.placement_target(&game.world, REACH)?;
+                Some(EditRequest {
+                    position,
+                    block: game.player.selected_block,
+                    topology_changed: game.player.selected_block.occludes(),
+                })
             }
             MouseButton::Middle => None,
         });
-        if let Some((position, light_update, topology_changed)) = edit {
-            self.refresh_mesh_world_snapshot();
-            self.rebuild_edited_chunks(position, light_update, topology_changed);
+        if let Some(request) = request {
+            self.submit_edit(request);
         }
         true
+    }
+
+    /// Queue a copy-on-write world edit so the input and presentation paths do
+    /// not wait for light propagation or mesh rebuilding.
+    fn submit_edit(&self, request: EditRequest) {
+        let (id, terrain_revision) = {
+            let mut runtime = self
+                .runtime
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if runtime.edit_job_in_flight.is_some() {
+                return;
+            }
+            runtime.next_mesh_job_id = runtime.next_mesh_job_id.wrapping_add(1);
+            let id = runtime.next_mesh_job_id;
+            runtime.terrain_revision = runtime.terrain_revision.wrapping_add(1);
+            runtime.build_queue.clear();
+            runtime.queued_chunks.clear();
+            runtime.in_flight_chunks.clear();
+            runtime.far_job_in_flight = None;
+            runtime.edit_job_in_flight = Some(id);
+            (id, runtime.terrain_revision)
+        };
+        let world = Arc::clone(
+            &self
+                .mesh_world
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        self.mesh_workers.submit_edit(MeshJob::Edit {
+            id,
+            terrain_revision,
+            world,
+            position: request.position,
+            block: request.block,
+            topology_changed: request.topology_changed,
+        });
+        self.status.set(String::from("Updating terrain…"));
     }
 
     /// Rebuild every resident chunk touched by changed geometry or light.
@@ -580,14 +647,20 @@ impl BoxcraftApp {
         }
 
         let resident_near = self.near_meshes.get();
-        let mut rebuilt = false;
+        let mut runtime = self
+            .runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         for chunk in affected
             .iter()
             .copied()
             .filter(|chunk| resident_near.contains_key(chunk))
         {
-            rebuilt |= self.build_near_chunk(chunk.0, chunk.1);
+            if runtime.queued_chunks.insert(chunk) {
+                runtime.build_queue.push_back(chunk);
+            }
         }
+        drop(runtime);
 
         let far_chunks: HashSet<(i32, i32)> = self
             .runtime
@@ -632,9 +705,6 @@ impl BoxcraftApp {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             runtime.far_dirty = true;
             runtime.far_generation = runtime.far_generation.wrapping_add(1);
-        }
-        if rebuilt {
-            self.refresh_frame_if_terrain_ready();
         }
     }
 
@@ -775,6 +845,9 @@ impl BoxcraftApp {
                 .runtime
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if runtime.edit_job_in_flight.is_some() {
+                return;
+            }
             let available = MAX_IN_FLIGHT_NEAR_JOBS.saturating_sub(runtime.in_flight_chunks.len());
             let mut jobs = Vec::with_capacity(available);
             for _ in 0..available {
@@ -809,7 +882,8 @@ impl BoxcraftApp {
                 .runtime
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if !runtime.far_dirty
+            if runtime.edit_job_in_flight.is_some()
+                || !runtime.far_dirty
                 || !runtime.build_queue.is_empty()
                 || !runtime.in_flight_chunks.is_empty()
                 || runtime.far_job_in_flight.is_some()
@@ -918,6 +992,37 @@ impl BoxcraftApp {
                         changed = true;
                     }
                 }
+                MeshResult::Edit(result) => {
+                    let accepted = {
+                        let mut runtime = self
+                            .runtime
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        if runtime.edit_job_in_flight != Some(result.id)
+                            || result.terrain_revision != runtime.terrain_revision
+                        {
+                            false
+                        } else {
+                            runtime.edit_job_in_flight = None;
+                            true
+                        }
+                    };
+                    if accepted {
+                        *self
+                            .mesh_world
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                            Arc::clone(&result.world);
+                        self.with_game(|game| game.world = Arc::clone(&result.world));
+                        self.rebuild_edited_chunks(
+                            result.position,
+                            result.light_update,
+                            result.topology_changed,
+                        );
+                        self.status.set(String::from("Terrain updated"));
+                        changed = true;
+                    }
+                }
             }
         }
         changed
@@ -943,6 +1048,14 @@ impl BoxcraftApp {
             .update(|revision| *revision = revision.wrapping_add(1));
         let revision = self.mesh_revision.get();
         for (group, core_meshes) in groups {
+            let bounds = mesh_bounds_for_cores(
+                &core_meshes,
+                MeshBounds::fallback(
+                    group.0 * FAR_MESH_GROUP_SIZE,
+                    group.1 * FAR_MESH_GROUP_SIZE,
+                    FAR_MESH_GROUP_SIZE,
+                ),
+            );
             let has_block_light = core_meshes
                 .iter()
                 .any(|core_mesh| mesh_has_block_light(core_mesh));
@@ -981,6 +1094,7 @@ impl BoxcraftApp {
                 Arc::new(TerrainMesh {
                     gpu: SgfxMesh::with_handle(handle, revision, vertices),
                     has_block_light,
+                    bounds,
                 }),
             );
         }
@@ -1042,22 +1156,6 @@ impl BoxcraftApp {
         self.refresh_frame();
     }
 
-    /// Build one chunk's retained SGFX meshes from the live world snapshot.
-    ///
-    /// Terrain supplies local UVs, material identity, and baked sky/block
-    /// light plus ambient occlusion. The frontend maps those into the pixel
-    /// atlas and writes one interpolated lighting color per vertex.
-    fn build_near_chunk(&self, chunk_x: i32, chunk_z: i32) -> bool {
-        let key = (chunk_x, chunk_z);
-        let core_mesh = Arc::new(self.with_game(|game| mesh_chunk(&game.world, chunk_x, chunk_z)));
-        self.near_core_meshes.update(|chunks| {
-            let mut next = (**chunks).clone();
-            next.insert(key, Arc::clone(&core_mesh));
-            *chunks = Arc::new(next);
-        });
-        self.update_near_mesh_from_core(key, &core_mesh)
-    }
-
     fn update_near_mesh_from_core(&self, key: (i32, i32), core_mesh: &boxcraft_core::Mesh) -> bool {
         let has_block_light = mesh_has_block_light(core_mesh);
         let daylight = if has_block_light {
@@ -1091,6 +1189,7 @@ impl BoxcraftApp {
         let mesh = Arc::new(TerrainMesh {
             gpu: SgfxMesh::with_handle(handle, revision, vertices),
             has_block_light,
+            bounds: mesh_bounds_for_core(core_mesh, key.0, key.1, 1),
         });
         self.near_meshes.update(|chunks| {
             let mut next = (**chunks).clone();
@@ -1135,6 +1234,14 @@ impl BoxcraftApp {
         let daylight = sunlight_daylight(self.sun_phase.get());
         let mut rebuilt = HashMap::with_capacity(groups.len());
         for (group, core_meshes) in groups {
+            let bounds = mesh_bounds_for_cores(
+                &core_meshes,
+                MeshBounds::fallback(
+                    group.0 * FAR_MESH_GROUP_SIZE,
+                    group.1 * FAR_MESH_GROUP_SIZE,
+                    FAR_MESH_GROUP_SIZE,
+                ),
+            );
             let mut vertices = Vec::new();
             for core_mesh in core_meshes {
                 append_lit_vertices(&core_mesh, daylight, &mut vertices);
@@ -1156,6 +1263,7 @@ impl BoxcraftApp {
                 Arc::new(TerrainMesh {
                     gpu: SgfxMesh::with_handle(handle, revision, vertices),
                     has_block_light: true,
+                    bounds,
                 }),
             );
         }
@@ -1171,9 +1279,10 @@ impl BoxcraftApp {
     }
 
     fn refresh_frame(&self) {
+        let far_plane = camera_far_plane(self.render_distance.get());
         let (camera, transform) = self.with_game(|game| {
             let camera = game.player.camera();
-            let transform = Mat4::perspective_rh_gl(CAMERA_FOV, REFERENCE_ASPECT, 0.05, 128.0)
+            let transform = Mat4::perspective_rh_gl(CAMERA_FOV, REFERENCE_ASPECT, 0.05, far_plane)
                 .mul_mat4(camera.view_matrix())
                 .columns;
             (camera, transform)
@@ -1187,15 +1296,9 @@ impl BoxcraftApp {
             .reference_aspect(REFERENCE_ASPECT);
         let daylight = sunlight_daylight(sun_phase);
         let far_meshes = self.presented_far_meshes.get();
-        for (_, mesh) in far_meshes.iter().filter(|(chunk, mesh)| {
+        for (_, mesh) in far_meshes.iter().filter(|(_, mesh)| {
             mesh.triangle_count() > 0
-                && chunk_is_visible(
-                    camera.position,
-                    camera.forward(),
-                    (**chunk).0 * FAR_MESH_GROUP_SIZE,
-                    (**chunk).1 * FAR_MESH_GROUP_SIZE,
-                    FAR_MESH_GROUP_SIZE,
-                )
+                && chunk_is_visible(camera.position, camera.forward(), mesh.bounds, far_plane)
         }) {
             let tint = if mesh.has_block_light {
                 Color::WHITE
@@ -1209,15 +1312,9 @@ impl BoxcraftApp {
             );
         }
         let near_meshes = self.presented_near_meshes.get();
-        for (_, meshes) in near_meshes.iter().filter(|(chunk, mesh)| {
+        for (_, meshes) in near_meshes.iter().filter(|(_, mesh)| {
             mesh.triangle_count() > 0
-                && chunk_is_visible(
-                    camera.position,
-                    camera.forward(),
-                    (**chunk).0,
-                    (**chunk).1,
-                    1,
-                )
+                && chunk_is_visible(camera.position, camera.forward(), mesh.bounds, far_plane)
         }) {
             let tint = if meshes.has_block_light {
                 Color::WHITE
@@ -1934,43 +2031,102 @@ fn should_hold_presented_terrain(far_dirty: bool, has_presented_far_ring: bool) 
     far_dirty && has_presented_far_ring
 }
 
-/// Return whether a horizontal chunk can intersect the camera's view cone.
-///
-/// This is intentionally conservative: the chunk's diagonal plus a small
-/// margin is treated as a circle, so a face at the edge of the viewport is not
-/// clipped just because its chunk centre is outside the exact FOV.
-fn chunk_is_visible(
-    camera_position: Vec3,
-    camera_forward: Vec3,
+fn mesh_bounds_for_core(
+    mesh: &boxcraft_core::Mesh,
     origin_x: i32,
     origin_z: i32,
     span: i32,
+) -> MeshBounds {
+    let Some(first) = mesh.vertices.first() else {
+        return MeshBounds::fallback(origin_x, origin_z, span);
+    };
+    let mut bounds = MeshBounds {
+        min: first.position,
+        max: first.position,
+    };
+    for vertex in &mesh.vertices[1..] {
+        bounds = bounds.union(MeshBounds {
+            min: vertex.position,
+            max: vertex.position,
+        });
+    }
+    bounds
+}
+
+fn mesh_bounds_for_cores(meshes: &[Arc<boxcraft_core::Mesh>], fallback: MeshBounds) -> MeshBounds {
+    meshes
+        .iter()
+        .filter_map(|mesh| {
+            mesh.vertices.first().map(|first| {
+                let mut bounds = MeshBounds {
+                    min: first.position,
+                    max: first.position,
+                };
+                for vertex in &mesh.vertices[1..] {
+                    bounds = bounds.union(MeshBounds {
+                        min: vertex.position,
+                        max: vertex.position,
+                    });
+                }
+                bounds
+            })
+        })
+        .reduce(MeshBounds::union)
+        .unwrap_or(fallback)
+}
+
+fn camera_far_plane(render_distance: i32) -> f32 {
+    let diameter = (render_distance.max(1) + 1) as f32 * CHUNK_SIZE as f32;
+    (diameter * core::f32::consts::SQRT_2 + CHUNK_SIZE as f32).max(128.0)
+}
+
+/// Return whether a mesh's world-space AABB can intersect the camera frustum.
+///
+/// The old test used only a horizontal chunk centre and therefore ignored
+/// camera pitch, terrain height, and the actual mesh extents. This conservative
+/// AABB/frustum test uses the same vertical FOV and reference aspect as the
+/// projection, so rotating the camera and the visible chunk set agree.
+fn chunk_is_visible(
+    camera_position: Vec3,
+    camera_forward: Vec3,
+    bounds: MeshBounds,
+    far_plane: f32,
 ) -> bool {
-    if span <= 0 {
+    let forward = camera_forward.normalized();
+    if forward.length() <= f32::EPSILON {
         return true;
     }
-    let center = Vec3::new(
-        origin_x as f32 * CHUNK_SIZE as f32 + CHUNK_SIZE as f32 * span as f32 * 0.5,
-        camera_position.y,
-        origin_z as f32 * CHUNK_SIZE as f32 + CHUNK_SIZE as f32 * span as f32 * 0.5,
-    );
-    let to_chunk = center - camera_position;
-    let distance = (to_chunk.x * to_chunk.x + to_chunk.z * to_chunk.z).sqrt();
-    let chunk_radius = CHUNK_SIZE as f32 * span as f32 * core::f32::consts::SQRT_2 * 0.5 + 2.0;
-    let horizontal_forward = Vec3::new(camera_forward.x, 0.0, camera_forward.z).normalized();
-    // When the eye is inside the chunk's conservative horizontal bound, some
-    // part of the chunk can surround the camera in every viewing direction.
-    // Applying an angular test here used to cull the player's own chunk when
-    // looking away from its centre, exposing distant terrain through it.
-    if distance <= chunk_radius || horizontal_forward.length() <= f32::EPSILON {
+    let right = Vec3::new(-forward.z, 0.0, forward.x).normalized();
+    if right.length() <= f32::EPSILON {
         return true;
+    }
+    let up = right.cross(forward).normalized();
+    let center = (bounds.min + bounds.max) * 0.5;
+    let extents = (bounds.max - bounds.min) * 0.5;
+    let relative = center - camera_position;
+    let depth = relative.dot(forward);
+    let depth_radius =
+        extents.x * forward.x.abs() + extents.y * forward.y.abs() + extents.z * forward.z.abs();
+    if depth + depth_radius < 0.05 || depth - depth_radius > far_plane {
+        return false;
     }
 
-    let direction = Vec3::new(to_chunk.x / distance, 0.0, to_chunk.z / distance);
-    let angular_margin = (chunk_radius / distance).clamp(0.0, 1.0).asin();
-    let horizontal_half_fov = ((CAMERA_FOV * 0.5).tan() * REFERENCE_ASPECT).atan();
-    let half_fov = horizontal_half_fov + angular_margin + 0.08;
-    direction.dot(horizontal_forward) >= half_fov.min(core::f32::consts::PI).cos()
+    let horizontal_tangent = (CAMERA_FOV * 0.5).tan() * REFERENCE_ASPECT;
+    let vertical_tangent = (CAMERA_FOV * 0.5).tan();
+    let horizontal_distance = relative.dot(right).abs();
+    let horizontal_radius =
+        extents.x * right.x.abs() + extents.y * right.y.abs() + extents.z * right.z.abs();
+    let vertical_distance = relative.dot(up).abs();
+    let vertical_radius = extents.x * up.x.abs() + extents.y * up.y.abs() + extents.z * up.z.abs();
+    let forward_for_fov = depth.max(0.0);
+    horizontal_distance
+        <= forward_for_fov * horizontal_tangent
+            + horizontal_radius
+            + depth_radius * horizontal_tangent
+        && vertical_distance
+            <= forward_for_fov * vertical_tangent
+                + vertical_radius
+                + depth_radius * vertical_tangent
 }
 
 #[cfg(test)]
@@ -1992,19 +2148,26 @@ mod tests {
 
     #[test]
     fn chunk_containing_the_camera_is_never_angle_culled() {
-        let camera = Vec3::new(0.0, 10.0, 0.0);
+        let camera = Vec3::new(8.0, 10.0, 8.0);
         let away_from_center = Vec3::new(-1.0, 0.0, -1.0).normalized();
-        assert!(chunk_is_visible(camera, away_from_center, 0, 0, 1));
+        let bounds = MeshBounds::fallback(0, 0, 1);
+        assert!(chunk_is_visible(camera, away_from_center, bounds, 128.0));
     }
 
     #[test]
-    fn chunk_culling_uses_horizontal_not_vertical_fov() {
+    fn chunk_culling_uses_the_camera_vertical_fov() {
         let camera = Vec3::zero();
         let forward = Vec3::new(0.0, 0.0, -1.0);
-        // About 45 degrees off-axis and far enough that the bound's angular
-        // margin does not mask the old vertical-FOV error.
-        assert!(chunk_is_visible(camera, forward, 9, -11, 1));
-        assert!(!chunk_is_visible(camera, forward, 0, 10, 1));
+        let centered = MeshBounds {
+            min: Vec3::new(-1.0, -1.0, -21.0),
+            max: Vec3::new(1.0, 1.0, -19.0),
+        };
+        let high = MeshBounds {
+            min: Vec3::new(-1.0, 20.0, -21.0),
+            max: Vec3::new(1.0, 22.0, -19.0),
+        };
+        assert!(chunk_is_visible(camera, forward, centered, 128.0));
+        assert!(!chunk_is_visible(camera, forward, high, 128.0));
     }
 
     #[test]

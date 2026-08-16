@@ -153,7 +153,7 @@ struct BoxcraftApp {
 impl BoxcraftApp {
     fn new() -> Self {
         let initial_frame = Arc::new(
-            SgfxCanvasFrame::new(0, Color::rgb(0.045, 0.075, 0.13))
+            SgfxCanvasFrame::new(0, sky_color(0.0))
                 .depth_tested()
                 .reference_aspect(REFERENCE_ASPECT),
         );
@@ -998,12 +998,12 @@ impl BoxcraftApp {
         });
         self.frame_revision
             .update(|revision| *revision = revision.wrapping_add(1));
-        let mut frame =
-            SgfxCanvasFrame::new(self.frame_revision.get(), Color::rgb(0.045, 0.075, 0.13))
-                .depth_tested()
-                // The SGFX renderer corrects this reference perspective as its canvas resizes.
-                .reference_aspect(REFERENCE_ASPECT);
-        let daylight = sunlight_daylight(self.sun_phase.get());
+        let sun_phase = self.sun_phase.get();
+        let mut frame = SgfxCanvasFrame::new(self.frame_revision.get(), sky_color(sun_phase))
+            .depth_tested()
+            // The SGFX renderer corrects this reference perspective as its canvas resizes.
+            .reference_aspect(REFERENCE_ASPECT);
+        let daylight = sunlight_daylight(sun_phase);
         let far_meshes = self.far_meshes.get();
         for (_, mesh) in far_meshes.iter().filter(|(chunk, mesh)| {
             mesh.triangle_count() > 0
@@ -1116,7 +1116,7 @@ impl BoxcraftApp {
             f32::INFINITY,
             self.canvas_frame.clone(),
         )
-        .placeholder(Color::rgb(0.045, 0.075, 0.13))
+        .placeholder(sky_color(self.sun_phase.get()))
         .frame(f32::INFINITY, f32::INFINITY);
         let game_area = zstack! {
             canvas,
@@ -1631,6 +1631,42 @@ fn sunlight_daylight(sun_phase: f32) -> f32 {
     (sunlight_direction(sun_phase).y * 0.5 + 0.5).clamp(0.08, 1.0)
 }
 
+/// Return a horizon-aware sky clear color for the current day-cycle phase.
+///
+/// The canvas has no sky geometry, so changing its clear color gives the day
+/// cycle a sunrise, blue daytime, sunset, and deep night without adding any
+/// vertices or draw calls.
+fn sky_color(sun_phase: f32) -> Color {
+    let sun = sunlight_direction(sun_phase);
+    let night = Color::rgb_f32(0.008, 0.018, 0.055);
+    let horizon = if sun.x >= 0.0 {
+        Color::rgb_f32(0.56, 0.28, 0.18)
+    } else {
+        Color::rgb_f32(0.46, 0.17, 0.26)
+    };
+    let day = Color::rgb_f32(0.30, 0.58, 0.92);
+
+    if sun.y <= 0.08 {
+        mix_color(night, horizon, smoothstep(-0.28, 0.08, sun.y))
+    } else {
+        mix_color(horizon, day, smoothstep(0.08, 0.58, sun.y))
+    }
+}
+
+fn mix_color(from: Color, to: Color, amount: f32) -> Color {
+    let amount = amount.clamp(0.0, 1.0);
+    Color::rgb_f32(
+        from.r + (to.r - from.r) * amount,
+        from.g + (to.g - from.g) * amount,
+        from.b + (to.b - from.b) * amount,
+    )
+}
+
+fn smoothstep(edge_start: f32, edge_end: f32, value: f32) -> f32 {
+    let amount = ((value - edge_start) / (edge_end - edge_start)).clamp(0.0, 1.0);
+    amount * amount * (3.0 - 2.0 * amount)
+}
+
 fn block_name(block: Block) -> &'static str {
     match block {
         Block::Air => "Air",
@@ -1784,6 +1820,20 @@ mod tests {
         for channel in 0..3 {
             assert!((baked_day[channel] * daylight - direct[channel]).abs() < 1.0e-6);
         }
+    }
+
+    #[test]
+    fn sky_color_follows_sunrise_day_sunset_and_night() {
+        let sunrise = sky_color(0.0);
+        let day = sky_color(0.25);
+        let sunset = sky_color(0.5);
+        let night = sky_color(0.75);
+
+        assert!(sunrise.r > sunrise.b);
+        assert!(sunset.r > sunset.b);
+        assert!(day.b > day.r);
+        assert!(day.b > night.b + 0.8);
+        assert!(night.r < 0.02);
     }
 
     fn test_vertex() -> boxcraft_core::Vertex {

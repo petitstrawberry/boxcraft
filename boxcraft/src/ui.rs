@@ -541,7 +541,7 @@ impl BoxcraftApp {
                 .far_dirty = true;
         }
         if rebuilt {
-            self.refresh_frame();
+            self.refresh_frame_if_terrain_ready();
         }
     }
 
@@ -642,8 +642,10 @@ impl BoxcraftApp {
                 next.retain(|chunk, _| far_set.contains(chunk));
                 *meshes = Arc::new(next);
             });
-            self.far_meshes
-                .set(Arc::new(HashMap::<(i32, i32), Arc<TerrainMesh>>::new()));
+            // Keep the currently presented far ring alive while the incoming
+            // near chunks are streamed. The completed near and far sets are
+            // handed to the canvas together, so a chunk-border crossing never
+            // presents an empty far ring or overlapping LODs.
             changed = true;
         }
         let mut missing: Vec<(i32, i32)> = desired
@@ -829,6 +831,33 @@ impl BoxcraftApp {
         }
         self.far_meshes.set(Arc::new(meshes));
         true
+    }
+
+    /// Keep the last complete canvas frame visible during a far-ring handoff.
+    ///
+    /// Near chunks are intentionally built over several idle ticks. Once a
+    /// far ring has been presented, publishing those intermediate near maps
+    /// would either expose holes or overlap the retained far LOD. Waiting only
+    /// affects presentation; chunk meshing still advances every idle tick.
+    fn terrain_handoff_pending(&self) -> bool {
+        let (far_dirty, chunks_pending) = {
+            let runtime = self
+                .runtime
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            (runtime.far_dirty, !runtime.build_queue.is_empty())
+        };
+        should_hold_previous_terrain_frame(
+            far_dirty,
+            chunks_pending,
+            !self.far_meshes.get().is_empty(),
+        )
+    }
+
+    fn refresh_frame_if_terrain_ready(&self) {
+        if !self.terrain_handoff_pending() {
+            self.refresh_frame();
+        }
     }
 
     /// Build one chunk's retained SGFX meshes from the live world snapshot.
@@ -1215,7 +1244,7 @@ impl Application for BoxcraftApp {
         {
             self.decorations_hidden.set(self.fullscreen_desired.get());
         }
-        self.refresh_frame();
+        self.refresh_frame_if_terrain_ready();
     }
 
     fn on_focus_changed(&mut self, _window_id: u32, _app_name: &str, _menu_titles: &str) {
@@ -1267,7 +1296,7 @@ impl Application for BoxcraftApp {
         frame_changed |= self.process_build_queue(CHUNKS_PER_FRAME);
         frame_changed |= self.rebuild_far_meshes_if_settled();
         if frame_changed {
-            self.refresh_frame();
+            self.refresh_frame_if_terrain_ready();
         }
     }
 
@@ -1635,6 +1664,14 @@ fn insert_chunks_for_voxel_bounds(
     }
 }
 
+fn should_hold_previous_terrain_frame(
+    far_dirty: bool,
+    chunks_pending: bool,
+    has_presented_far_ring: bool,
+) -> bool {
+    far_dirty && chunks_pending && has_presented_far_ring
+}
+
 /// Return whether a horizontal chunk can intersect the camera's view cone.
 ///
 /// This is intentionally conservative: the chunk's diagonal plus a small
@@ -1677,6 +1714,14 @@ fn chunk_is_visible(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completed_far_ring_stays_presented_until_incoming_near_chunks_are_ready() {
+        assert!(should_hold_previous_terrain_frame(true, true, true));
+        assert!(!should_hold_previous_terrain_frame(true, false, true));
+        assert!(!should_hold_previous_terrain_frame(false, true, true));
+        assert!(!should_hold_previous_terrain_frame(true, true, false));
+    }
 
     #[test]
     fn chunk_containing_the_camera_is_never_angle_culled() {

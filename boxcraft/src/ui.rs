@@ -1789,10 +1789,10 @@ fn sunlight_daylight(sun_phase: f32) -> f32 {
 fn sky_color(sun_phase: f32) -> Color {
     let sun = sunlight_direction(sun_phase);
     let night = Color::rgb_f32(0.008, 0.018, 0.055);
-    // Keep both horizons in the warm amber range. A single clear color has
-    // no vertical atmospheric gradient, so a magenta sunset reads as an
+    // Keep both horizons in a muted red-orange range. A single clear color has
+    // no vertical atmospheric gradient, so purple or yellow hues read as an
     // artificial tint across the whole sky instead of a natural horizon glow.
-    let horizon = Color::rgb_f32(0.58, 0.27, 0.09);
+    let horizon = Color::rgb_f32(0.52, 0.19, 0.08);
     let day = Color::rgb_f32(0.35, 0.59, 0.86);
 
     if sun.y <= 0.08 {

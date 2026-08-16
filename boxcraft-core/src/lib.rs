@@ -509,6 +509,9 @@ pub struct World {
     height: usize,
     depth: usize,
     blocks: PagedVec<Block>,
+    /// Highest opaque voxel for each x/z column. This is maintained by
+    /// `set` so visibility queries can skip empty sky volume.
+    skyline: PagedVec<i32>,
     direct_sunlight: PagedVec<u8>,
     sunlight: PagedVec<u8>,
     block_light: PagedVec<u8>,
@@ -623,6 +626,10 @@ pub struct VisibleSpace {
     width: usize,
     height: usize,
     depth: usize,
+    /// Highest fully opaque voxel in each x/z column. Cells above this
+    /// skyline are connected to the exterior by definition and do not need
+    /// to be inserted into the flood-fill queue.
+    skyline: Vec<i32>,
     reachable: Vec<u8>,
 }
 
@@ -632,13 +639,31 @@ impl VisibleSpace {
     /// The returned snapshot remains valid until block topology changes.
     /// Lighting-only updates do not invalidate it.
     pub fn from_world(world: &World, viewer: IVec3) -> Self {
+        let skyline: Vec<i32> = world.skyline.iter().copied().collect();
         let mut visible = Self {
             width: world.width,
             height: world.height,
             depth: world.depth,
+            skyline,
             reachable: vec![0; world.blocks.len()],
         };
         let mut queue = std::collections::VecDeque::new();
+
+        // Start one frontier cell above every terrain column. The cells above
+        // the skyline are treated as exterior without being queued; only the
+        // frontier can descend through a shaft or cross into a cave mouth.
+        for z in 0..world.depth as i32 {
+            for x in 0..world.width as i32 {
+                let top = visible.skyline[z as usize * world.width + x as usize];
+                if top >= 0 {
+                    visible.enqueue_frontier(
+                        world,
+                        &mut queue,
+                        IVec3::new(x, top.saturating_add(1), z),
+                    );
+                }
+            }
+        }
 
         if world.width > 0 {
             for y in 0..world.height as i32 {
@@ -689,6 +714,9 @@ impl VisibleSpace {
         let Some(index) = self.index(position) else {
             return true;
         };
+        if self.is_above_skyline(position) {
+            return true;
+        }
         self.reachable
             .get(index)
             .is_some_and(|reachable| *reachable != 0)
@@ -698,10 +726,34 @@ impl VisibleSpace {
         self.width == world.width
             && self.height == world.height
             && self.depth == world.depth
+            && self.skyline.len() == world.width.saturating_mul(world.depth)
             && self.reachable.len() == world.blocks.len()
     }
 
+    fn is_above_skyline(&self, position: IVec3) -> bool {
+        position.y > self.skyline[position.z as usize * self.width + position.x as usize]
+    }
+
     fn enqueue(
+        &mut self,
+        world: &World,
+        queue: &mut std::collections::VecDeque<usize>,
+        position: IVec3,
+    ) {
+        let Some(index) = world.index(position) else {
+            return;
+        };
+        if self.is_above_skyline(position)
+            || self.reachable[index] != 0
+            || world.blocks[index].occludes()
+        {
+            return;
+        }
+        self.reachable[index] = 1;
+        queue.push_back(index);
+    }
+
+    fn enqueue_frontier(
         &mut self,
         world: &World,
         queue: &mut std::collections::VecDeque<usize>,
@@ -753,6 +805,7 @@ impl World {
             height,
             depth,
             blocks: PagedVec::filled(cells, Block::Air),
+            skyline: PagedVec::filled(width.saturating_mul(depth), -1),
             direct_sunlight: PagedVec::filled(cells, 0),
             sunlight: PagedVec::filled(cells, 0),
             block_light: PagedVec::filled(cells, 0),
@@ -1259,7 +1312,25 @@ impl World {
     /// Returns `true` if a cell was updated.
     pub fn set(&mut self, position: IVec3, block: Block) -> bool {
         if let Some(index) = self.index(position) {
+            let previous = self.blocks[index];
             self.blocks[index] = block;
+            let column = position.z as usize * self.width + position.x as usize;
+            if block.occludes() {
+                if position.y > self.skyline[column] {
+                    self.skyline[column] = position.y;
+                }
+            } else if previous.occludes() && self.skyline[column] == position.y {
+                let mut highest = -1;
+                for y in (0..position.y).rev() {
+                    let index = (y as usize * self.depth + position.z as usize) * self.width
+                        + position.x as usize;
+                    if self.blocks[index].occludes() {
+                        highest = y;
+                        break;
+                    }
+                }
+                self.skyline[column] = highest;
+            }
             true
         } else {
             false
@@ -1503,6 +1574,97 @@ pub struct Mesh {
     pub indices: Vec<u32>,
 }
 
+#[derive(Clone, Copy)]
+struct GreedyFaceSpec {
+    normal: IVec3,
+    base: Vec3,
+    u: Vec3,
+    v: Vec3,
+    u_axis: usize,
+    v_axis: usize,
+}
+
+const GREEDY_FACE_SPECS: [GreedyFaceSpec; 6] = [
+    GreedyFaceSpec {
+        normal: IVec3::new(-1, 0, 0),
+        base: Vec3::new(0.0, 0.0, 0.0),
+        u: Vec3::new(0.0, 0.0, 1.0),
+        v: Vec3::new(0.0, 1.0, 0.0),
+        u_axis: 2,
+        v_axis: 1,
+    },
+    GreedyFaceSpec {
+        normal: IVec3::new(1, 0, 0),
+        base: Vec3::new(1.0, 0.0, 1.0),
+        u: Vec3::new(0.0, 0.0, -1.0),
+        v: Vec3::new(0.0, 1.0, 0.0),
+        u_axis: 2,
+        v_axis: 1,
+    },
+    GreedyFaceSpec {
+        normal: IVec3::new(0, -1, 0),
+        base: Vec3::new(0.0, 0.0, 1.0),
+        u: Vec3::new(1.0, 0.0, 0.0),
+        v: Vec3::new(0.0, 0.0, -1.0),
+        u_axis: 0,
+        v_axis: 2,
+    },
+    GreedyFaceSpec {
+        normal: IVec3::new(0, 1, 0),
+        base: Vec3::new(0.0, 1.0, 0.0),
+        u: Vec3::new(0.0, 0.0, 1.0),
+        v: Vec3::new(1.0, 0.0, 0.0),
+        u_axis: 2,
+        v_axis: 0,
+    },
+    GreedyFaceSpec {
+        normal: IVec3::new(0, 0, -1),
+        base: Vec3::new(1.0, 0.0, 0.0),
+        u: Vec3::new(-1.0, 0.0, 0.0),
+        v: Vec3::new(0.0, 1.0, 0.0),
+        u_axis: 0,
+        v_axis: 1,
+    },
+    GreedyFaceSpec {
+        normal: IVec3::new(0, 0, 1),
+        base: Vec3::new(0.0, 0.0, 1.0),
+        u: Vec3::new(1.0, 0.0, 0.0),
+        v: Vec3::new(0.0, 1.0, 0.0),
+        u_axis: 0,
+        v_axis: 1,
+    },
+];
+
+#[derive(Clone, Copy)]
+struct GreedyLighting {
+    ambient_occlusion: f32,
+    light: f32,
+    torch_light: f32,
+}
+
+#[derive(Clone, Copy)]
+struct GreedyFaceCell {
+    block: Block,
+    inset_surface: bool,
+    lighting: [GreedyLighting; 4],
+}
+
+impl GreedyFaceCell {
+    fn matches(self, other: Self) -> bool {
+        self.block == other.block
+            && self.inset_surface == other.inset_surface
+            && self
+                .lighting
+                .iter()
+                .zip(other.lighting)
+                .all(|(left, right)| {
+                    left.ambient_occlusion.to_bits() == right.ambient_occlusion.to_bits()
+                        && left.light.to_bits() == right.light.to_bits()
+                        && left.torch_light.to_bits() == right.torch_light.to_bits()
+                })
+    }
+}
+
 /// Builds a simple, non-greedy mesh containing only faces bordering air.
 ///
 /// # Arguments
@@ -1570,7 +1732,7 @@ pub fn mesh_chunk_lod(
     // A stale or foreign map must fail open: extra geometry is safe, holes are
     // not. The frontend normally replaces the snapshot after every edit.
     let visible_space = visible_space.matches(world).then_some(visible_space);
-    mesh_region(
+    mesh_region_greedy(
         world,
         chunk_x * CHUNK_SIZE,
         (chunk_x + 1) * CHUNK_SIZE - 1,
@@ -1578,6 +1740,274 @@ pub fn mesh_chunk_lod(
         (chunk_z + 1) * CHUNK_SIZE - 1,
         visible_space,
     )
+}
+
+fn mesh_region_greedy(
+    world: &World,
+    min_x: i32,
+    max_x: i32,
+    min_z: i32,
+    max_z: i32,
+    visible_space: Option<&VisibleSpace>,
+) -> Mesh {
+    let min_x = min_x.max(0);
+    let max_x = max_x.min(world.width as i32 - 1);
+    let min_z = min_z.max(0);
+    let max_z = max_z.min(world.depth as i32 - 1);
+    if min_x > max_x || min_z > max_z || world.height == 0 {
+        return Mesh::default();
+    }
+
+    let mut mesh = Mesh::default();
+    for y in 0..world.height as i32 {
+        for z in min_z..=max_z {
+            for x in min_x..=max_x {
+                let position = IVec3::new(x, y, z);
+                if world.block(position) == Some(Block::Torch) {
+                    append_torch_mesh(world, &mut mesh, position);
+                }
+            }
+        }
+    }
+
+    for spec in GREEDY_FACE_SPECS {
+        let (plane_min, plane_max, u_min, u_max, v_min, v_max) =
+            greedy_face_limits(spec, min_x, max_x, min_z, max_z, world.height as i32);
+        if plane_min > plane_max || u_min > u_max || v_min > v_max {
+            continue;
+        }
+        let u_len = (u_max - u_min + 1) as usize;
+        let v_len = (v_max - v_min + 1) as usize;
+        for plane in plane_min..=plane_max {
+            let mut mask = vec![None; u_len * v_len];
+            for v_index in 0..v_len {
+                for u_index in 0..u_len {
+                    let position = greedy_face_position(
+                        spec, plane, u_index, v_index, u_min, u_max, v_min, v_max,
+                    );
+                    mask[v_index * u_len + u_index] =
+                        greedy_face_cell(world, position, spec, visible_space);
+                }
+            }
+
+            for v_index in 0..v_len {
+                for u_index in 0..u_len {
+                    let index = v_index * u_len + u_index;
+                    let Some(cell) = mask[index] else {
+                        continue;
+                    };
+                    let mut width = 1;
+                    while u_index + width < u_len
+                        && mask[v_index * u_len + u_index + width]
+                            .is_some_and(|candidate| cell.matches(candidate))
+                    {
+                        width += 1;
+                    }
+                    let mut height = 1;
+                    'height: while v_index + height < v_len {
+                        for u_offset in 0..width {
+                            let candidate = mask[(v_index + height) * u_len + u_index + u_offset];
+                            if !candidate.is_some_and(|candidate| cell.matches(candidate)) {
+                                break 'height;
+                            }
+                        }
+                        height += 1;
+                    }
+
+                    let position = greedy_face_position(
+                        spec, plane, u_index, v_index, u_min, u_max, v_min, v_max,
+                    );
+                    append_greedy_face(&mut mesh, position, spec, cell, width, height);
+                    for clear_v in v_index..v_index + height {
+                        for clear_u in u_index..u_index + width {
+                            mask[clear_v * u_len + clear_u] = None;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    mesh
+}
+
+fn greedy_face_limits(
+    spec: GreedyFaceSpec,
+    min_x: i32,
+    max_x: i32,
+    min_z: i32,
+    max_z: i32,
+    height: i32,
+) -> (i32, i32, i32, i32, i32, i32) {
+    if spec.normal.x != 0 {
+        (min_x, max_x, min_z, max_z, 0, height - 1)
+    } else if spec.normal.y != 0 {
+        (0, height - 1, min_z, max_z, min_x, max_x)
+    } else {
+        (min_z, max_z, min_x, max_x, 0, height - 1)
+    }
+}
+
+fn axis_sign(vector: Vec3, axis: usize) -> i32 {
+    match axis {
+        0 => vector.x as i32,
+        1 => vector.y as i32,
+        _ => vector.z as i32,
+    }
+}
+
+fn set_axis(position: &mut IVec3, axis: usize, value: i32) {
+    match axis {
+        0 => position.x = value,
+        1 => position.y = value,
+        _ => position.z = value,
+    }
+}
+
+fn greedy_face_position(
+    spec: GreedyFaceSpec,
+    plane: i32,
+    u_index: usize,
+    v_index: usize,
+    u_min: i32,
+    u_max: i32,
+    v_min: i32,
+    v_max: i32,
+) -> IVec3 {
+    let mut position = IVec3::default();
+    let normal_axis = if spec.normal.x != 0 {
+        0
+    } else if spec.normal.y != 0 {
+        1
+    } else {
+        2
+    };
+    let u_value = if axis_sign(spec.u, spec.u_axis) > 0 {
+        u_min + u_index as i32
+    } else {
+        u_max - u_index as i32
+    };
+    let v_value = if axis_sign(spec.v, spec.v_axis) > 0 {
+        v_min + v_index as i32
+    } else {
+        v_max - v_index as i32
+    };
+    set_axis(&mut position, normal_axis, plane);
+    set_axis(&mut position, spec.u_axis, u_value);
+    set_axis(&mut position, spec.v_axis, v_value);
+    position
+}
+
+fn greedy_face_cell(
+    world: &World,
+    position: IVec3,
+    spec: GreedyFaceSpec,
+    visible_space: Option<&VisibleSpace>,
+) -> Option<GreedyFaceCell> {
+    let block = world
+        .block(position)
+        .filter(|block| block.is_renderable())?;
+    if block == Block::Torch {
+        return None;
+    }
+    let neighbor = position + spec.normal;
+    let neighbor_block = world.block(neighbor);
+    let face_visible = neighbor_block.is_none_or(|neighbor| {
+        !neighbor.occludes() && !(block == Block::Water && neighbor == Block::Water)
+    });
+    if !face_visible || visible_space.is_some_and(|space| !space.reaches(neighbor)) {
+        return None;
+    }
+    let inset_surface = block == Block::Water
+        && spec.normal.y > 0
+        && neighbor_block.is_none_or(|neighbor| !neighbor.is_renderable());
+    let normal = Vec3::new(
+        spec.normal.x as f32,
+        spec.normal.y as f32,
+        spec.normal.z as f32,
+    );
+    let corners = [
+        spec.base,
+        spec.base + spec.u,
+        spec.base + spec.u + spec.v,
+        spec.base + spec.v,
+    ];
+    let lighting = corners.map(|corner| {
+        let corner = if inset_surface && corner.y >= 1.0 {
+            Vec3::new(corner.x, 0.875, corner.z)
+        } else {
+            corner
+        };
+        let light = vertex_light(world, position, normal, corner);
+        GreedyLighting {
+            ambient_occlusion: vertex_ambient_occlusion(world, position, normal, corner),
+            light: light[0],
+            torch_light: light[1],
+        }
+    });
+    Some(GreedyFaceCell {
+        block,
+        inset_surface,
+        lighting,
+    })
+}
+
+fn append_greedy_face(
+    mesh: &mut Mesh,
+    position: IVec3,
+    spec: GreedyFaceSpec,
+    cell: GreedyFaceCell,
+    width: usize,
+    height: usize,
+) {
+    const FACE_UVS: [[f32; 2]; 4] = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+    let offset = Vec3::new(position.x as f32, position.y as f32, position.z as f32);
+    let width = width as f32;
+    let height = height as f32;
+    let corners = [
+        spec.base,
+        spec.base + spec.u * width,
+        spec.base + spec.u * width + spec.v * height,
+        spec.base + spec.v * height,
+    ];
+    let normal = Vec3::new(
+        spec.normal.x as f32,
+        spec.normal.y as f32,
+        spec.normal.z as f32,
+    );
+    let first = mesh.vertices.len() as u32;
+    for (index, (corner, uv)) in corners.into_iter().zip(FACE_UVS).enumerate() {
+        let corner = if cell.inset_surface && corner.y >= 1.0 {
+            Vec3::new(corner.x, 0.875, corner.z)
+        } else {
+            corner
+        };
+        let lighting = cell.lighting[index];
+        mesh.vertices.push(Vertex {
+            position: offset + corner,
+            normal,
+            color: cell.block.color(),
+            block: cell.block,
+            atlas_uv: atlas_uv(cell.block, normal, uv),
+            ambient_occlusion: lighting.ambient_occlusion,
+            light: lighting.light,
+            torch_light: lighting.torch_light,
+        });
+    }
+    mesh.indices
+        .extend_from_slice(&[first, first + 1, first + 2, first, first + 2, first + 3]);
+    if cell.inset_surface && normal.y > 0.0 {
+        let base = mesh.vertices.len() as u32;
+        let mut underside = Vec::with_capacity(4);
+        for vertex in &mesh.vertices[first as usize..first as usize + 4] {
+            underside.push(Vertex {
+                normal: Vec3::new(0.0, -1.0, 0.0),
+                ..*vertex
+            });
+        }
+        mesh.vertices.extend(underside);
+        mesh.indices
+            .extend_from_slice(&[base + 2, base + 1, base, base + 3, base + 2, base]);
+    }
 }
 
 fn mesh_region(
@@ -2541,13 +2971,27 @@ mod tests {
     use super::{
         Block, CHUNK_SIZE, DEFAULT_WORLD_DEPTH, DEFAULT_WORLD_HEIGHT, DEFAULT_WORLD_WIDTH, IVec3,
         Mat4, Mesh, Player, PlayerInput, SEA_LEVEL, Vec3, VisibleSpace, World, mesh_chunk,
-        mesh_chunk_lod, mesh_world, terrain_height,
+        mesh_chunk_lod, mesh_region_greedy, mesh_world, terrain_height,
     };
 
     #[test]
     fn generation_is_deterministic() {
         assert_eq!(World::generate(42), World::generate(42));
         assert_ne!(World::generate(42), World::generate(43));
+    }
+
+    #[test]
+    fn skyline_cache_tracks_the_highest_opaque_edit() {
+        let mut world = World::new(3, 8, 3);
+        let column = 1 * world.width + 1;
+        world.set(IVec3::new(1, 2, 1), Block::Stone);
+        assert_eq!(world.skyline[column], 2);
+        world.set(IVec3::new(1, 5, 1), Block::Stone);
+        assert_eq!(world.skyline[column], 5);
+        world.set(IVec3::new(1, 5, 1), Block::Air);
+        assert_eq!(world.skyline[column], 2);
+        world.set(IVec3::new(1, 2, 1), Block::Air);
+        assert_eq!(world.skyline[column], -1);
     }
 
     #[test]
@@ -2991,6 +3435,20 @@ mod tests {
     }
 
     #[test]
+    fn greedy_far_mesh_merges_flat_runs() {
+        let mut world = World::new(16, 8, 16);
+        for z in 0..16 {
+            for x in 0..16 {
+                world.set(IVec3::new(x, 0, z), Block::Stone);
+            }
+        }
+        let regular = mesh_chunk(&world, 0, 0);
+        let greedy = mesh_region_greedy(&world, 0, 15, 0, 15, None);
+        assert!(greedy.vertices.len() < regular.vertices.len() / 4);
+        assert_eq!(greedy.indices.len(), greedy.vertices.len() / 4 * 6);
+    }
+
+    #[test]
     fn mesh_supplies_atlas_uvs_and_corner_shading_metadata() {
         let mut world = World::new(4, 4, 4);
         world.set(IVec3::new(1, 1, 1), Block::Stone);
@@ -3099,7 +3557,7 @@ mod tests {
         assert_eq!(world.sunlight(IVec3::new(24, 3, 3)), 0);
 
         let visible_space = VisibleSpace::from_world(&world, IVec3::new(0, 3, 3));
-        let full = mesh_chunk(&world, 1, 0);
+        let full = mesh_region_greedy(&world, 16, 31, 0, 7, None);
         let lod = mesh_chunk_lod(&world, 1, 0, &visible_space);
         assert_eq!(lod.vertices.len(), full.vertices.len());
         assert_eq!(lod.indices.len(), full.indices.len());
@@ -3124,7 +3582,7 @@ mod tests {
         }
 
         let visible_space = VisibleSpace::from_world(&world, IVec3::new(4, 4, 4));
-        let full = mesh_chunk(&world, 0, 0);
+        let full = mesh_region_greedy(&world, 0, 7, 0, 7, None);
         let lod = mesh_chunk_lod(&world, 0, 0, &visible_space);
         assert_eq!(lod.vertices.len(), full.vertices.len());
         assert_eq!(lod.indices.len(), full.indices.len());

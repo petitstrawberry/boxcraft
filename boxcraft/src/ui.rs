@@ -37,6 +37,13 @@ const SUNLIGHT_UPDATES_PER_SECOND: f32 = 4.0;
 /// Keep both workers busy without allowing stale movement jobs to pile up.
 const MAX_IN_FLIGHT_NEAR_JOBS: usize = WORKER_COUNT * 2;
 const MAX_MESH_RESULTS_PER_IDLE: usize = 2;
+/// Cap CPU-side vertex expansion and SGFX mesh replacement per idle tick.
+/// One oversized result is still allowed through so a single chunk cannot
+/// starve forever, but a burst of streamed chunks is spread over later ticks.
+const MAX_MESH_UPLOAD_VERTICES_PER_IDLE: usize = 60_000;
+/// Stay below ScarletUI SGFX's frame vertex ceiling and leave headroom for
+/// future canvas overlays. Near terrain is selected before distant terrain.
+const MAX_TERRAIN_FRAME_VERTICES: usize = 180_000;
 /// Default and inclusive bounds for the configurable render distance.
 const DEFAULT_RENDER_DISTANCE: i32 = 5;
 const MIN_RENDER_DISTANCE: i32 = 1;
@@ -46,7 +53,8 @@ const MAX_RENDER_DISTANCE: i32 = 12;
 const NEAR_CHUNK_RADIUS: i32 = 2;
 /// Far meshes combine a small tile of chunks to keep SGFX draw-state commands
 /// below its opaque command-stream limit while retaining coarse culling.
-const FAR_MESH_GROUP_SIZE: i32 = 2;
+const FAR_MESH_GROUP_SIZE: i32 = 4;
+const MAX_FAR_GROUPS_PER_JOB: usize = 4;
 
 static NEXT_WORLD_SEED: AtomicU64 = AtomicU64::new(0xB0CA_FE00_2026_0001);
 
@@ -95,6 +103,7 @@ struct Runtime {
     player_chunk: (i32, i32),
     far_dirty: bool,
     far_chunks: Vec<(i32, i32)>,
+    far_pending_chunks: Vec<(i32, i32)>,
     far_generation: u64,
     far_job_in_flight: Option<u64>,
     edit_job_in_flight: Option<u64>,
@@ -117,6 +126,7 @@ impl Runtime {
             player_chunk: (i32::MAX, i32::MAX),
             far_dirty: false,
             far_chunks: Vec::new(),
+            far_pending_chunks: Vec::new(),
             far_generation: 0,
             far_job_in_flight: None,
             edit_job_in_flight: None,
@@ -411,6 +421,7 @@ impl BoxcraftApp {
             runtime.player_chunk = (i32::MAX, i32::MAX);
             runtime.far_dirty = false;
             runtime.far_chunks.clear();
+            runtime.far_pending_chunks.clear();
             runtime.far_generation = runtime.far_generation.wrapping_add(1);
             runtime.far_job_in_flight = None;
             runtime.edit_job_in_flight = None;
@@ -703,6 +714,10 @@ impl BoxcraftApp {
                 .runtime
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // Rebuild complete far groups in priority order. Keeping this
+            // queue explicit lets a lighting edit update the visible part of
+            // the ring first instead of waiting for every distant chunk.
+            runtime.far_pending_chunks = runtime.far_chunks.clone();
             runtime.far_dirty = true;
             runtime.far_generation = runtime.far_generation.wrapping_add(1);
         }
@@ -717,11 +732,16 @@ impl BoxcraftApp {
     /// evicts retired handles.
     fn refresh_chunk_set(&self) -> bool {
         let mut changed = false;
-        let player_chunk = self.with_game(|game| {
+        let (player_chunk, camera_position, camera_forward) = self.with_game(|game| {
             let position = game.player.position;
+            let camera = game.player.camera();
             (
-                (position.x as i32).div_euclid(CHUNK_SIZE),
-                (position.z as i32).div_euclid(CHUNK_SIZE),
+                (
+                    (position.x as i32).div_euclid(CHUNK_SIZE),
+                    (position.z as i32).div_euclid(CHUNK_SIZE),
+                ),
+                camera.position,
+                camera.forward(),
             )
         });
         let distance = self.render_distance.get();
@@ -739,7 +759,26 @@ impl BoxcraftApp {
             .copied()
             .filter(|chunk| !near.contains(chunk))
             .collect();
-        far.sort_unstable();
+        far.sort_by(|left, right| {
+            far_group_stream_priority(*left, player_chunk, camera_position, camera_forward)
+                .partial_cmp(&far_group_stream_priority(
+                    *right,
+                    player_chunk,
+                    camera_position,
+                    camera_forward,
+                ))
+                .unwrap_or(core::cmp::Ordering::Equal)
+                .then_with(|| {
+                    chunk_stream_priority(*left, player_chunk, camera_position, camera_forward)
+                        .partial_cmp(&chunk_stream_priority(
+                            *right,
+                            player_chunk,
+                            camera_position,
+                            camera_forward,
+                        ))
+                        .unwrap_or(core::cmp::Ordering::Equal)
+                })
+        });
 
         let removed: Vec<(i32, i32)> = self
             .near_meshes
@@ -797,20 +836,36 @@ impl BoxcraftApp {
             runtime.build_queue.retain(|chunk| queued.contains(chunk));
         }
         runtime.player_chunk = player_chunk;
-        if runtime.far_chunks != far {
+        let current_far_set: HashSet<(i32, i32)> = runtime.far_chunks.iter().copied().collect();
+        if current_far_set != far_set {
             runtime.far_chunks = far;
-            runtime.far_dirty = true;
+            runtime.far_pending_chunks = runtime.far_chunks.clone();
+            runtime.far_dirty = !runtime.far_pending_chunks.is_empty();
             runtime.far_generation = runtime.far_generation.wrapping_add(1);
             self.far_core_meshes.update(|meshes| {
                 let mut next = (**meshes).clone();
                 next.retain(|chunk, _| far_set.contains(chunk));
                 *meshes = Arc::new(next);
             });
+            self.far_meshes
+                .set(Arc::new(HashMap::<(i32, i32), Arc<TerrainMesh>>::new()));
             // Keep the currently presented far ring alive while the incoming
             // near chunks are streamed. The completed near and far sets are
             // handed to the canvas together, so a chunk-border crossing never
             // presents an empty far ring or overlapping LODs.
             changed = true;
+        } else {
+            // A camera turn changes priority, not residency. Reorder only the
+            // not-yet-built queue and keep the current generation/meshes
+            // intact; otherwise looking around would restart the whole ring.
+            let pending: HashSet<(i32, i32)> = runtime.far_pending_chunks.iter().copied().collect();
+            runtime.far_chunks = far;
+            runtime.far_pending_chunks = runtime
+                .far_chunks
+                .iter()
+                .copied()
+                .filter(|chunk| pending.contains(chunk))
+                .collect();
         }
         let mut missing: Vec<(i32, i32)> = desired
             .into_iter()
@@ -820,10 +875,15 @@ impl BoxcraftApp {
                     && !runtime.queued_chunks.contains(chunk)
             })
             .collect();
-        missing.sort_by_key(|chunk| {
-            (chunk.0 - player_chunk.0)
-                .abs()
-                .max((chunk.1 - player_chunk.1).abs())
+        missing.sort_by(|left, right| {
+            chunk_stream_priority(*left, player_chunk, camera_position, camera_forward)
+                .partial_cmp(&chunk_stream_priority(
+                    *right,
+                    player_chunk,
+                    camera_position,
+                    camera_forward,
+                ))
+                .unwrap_or(core::cmp::Ordering::Equal)
         });
         for chunk in missing {
             runtime.queued_chunks.insert(chunk);
@@ -884,21 +944,33 @@ impl BoxcraftApp {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if runtime.edit_job_in_flight.is_some()
                 || !runtime.far_dirty
+                || runtime.far_pending_chunks.is_empty()
                 || !runtime.build_queue.is_empty()
                 || !runtime.in_flight_chunks.is_empty()
                 || runtime.far_job_in_flight.is_some()
             {
                 return;
             }
+            let mut groups = HashSet::new();
+            for chunk in &runtime.far_pending_chunks {
+                groups.insert(far_group_for_chunk(*chunk));
+                if groups.len() >= MAX_FAR_GROUPS_PER_JOB {
+                    break;
+                }
+            }
+            let batch: Vec<(i32, i32)> = runtime
+                .far_pending_chunks
+                .iter()
+                .copied()
+                .filter(|chunk| groups.contains(&far_group_for_chunk(*chunk)))
+                .collect();
+            if batch.is_empty() {
+                return;
+            }
             runtime.next_mesh_job_id = runtime.next_mesh_job_id.wrapping_add(1);
             let id = runtime.next_mesh_job_id;
             runtime.far_job_in_flight = Some(id);
-            (
-                id,
-                runtime.terrain_revision,
-                runtime.far_generation,
-                runtime.far_chunks.clone(),
-            )
+            (id, runtime.terrain_revision, runtime.far_generation, batch)
         };
         let camera = self.with_game(|game| game.player.camera().position);
         let viewer = IVec3::new(
@@ -932,12 +1004,33 @@ impl BoxcraftApp {
     /// Apply completed CPU meshes on the UI thread and discard stale jobs.
     fn process_mesh_results(&self) -> bool {
         let mut changed = false;
+        let mut uploaded_vertices: usize = 0;
         for _ in 0..MAX_MESH_RESULTS_PER_IDLE {
             let Some(result) = self.mesh_workers.try_recv() else {
                 break;
             };
             match result {
                 MeshResult::Near(result) => {
+                    let estimated_vertices = result.mesh.indices.len();
+                    let current = self
+                        .runtime
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .in_flight_chunks
+                        .get(&result.chunk)
+                        .copied()
+                        == Some(result.id);
+                    if current
+                        && uploaded_vertices > 0
+                        && uploaded_vertices.saturating_add(estimated_vertices)
+                            > MAX_MESH_UPLOAD_VERTICES_PER_IDLE
+                    {
+                        self.mesh_workers.defer(MeshResult::Near(result));
+                        break;
+                    }
+                    if current {
+                        uploaded_vertices = uploaded_vertices.saturating_add(estimated_vertices);
+                    }
                     let accepted = {
                         let mut runtime = self
                             .runtime
@@ -967,6 +1060,28 @@ impl BoxcraftApp {
                     }
                 }
                 MeshResult::Far(result) => {
+                    let estimated_vertices = result
+                        .meshes
+                        .values()
+                        .map(|mesh| mesh.indices.len())
+                        .sum::<usize>();
+                    let current = self
+                        .runtime
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .far_job_in_flight
+                        == Some(result.id);
+                    if current
+                        && uploaded_vertices > 0
+                        && uploaded_vertices.saturating_add(estimated_vertices)
+                            > MAX_MESH_UPLOAD_VERTICES_PER_IDLE
+                    {
+                        self.mesh_workers.defer(MeshResult::Far(result));
+                        break;
+                    }
+                    if current {
+                        uploaded_vertices = uploaded_vertices.saturating_add(estimated_vertices);
+                    }
                     let accepted = {
                         let mut runtime = self
                             .runtime
@@ -976,19 +1091,28 @@ impl BoxcraftApp {
                             false
                         } else {
                             runtime.far_job_in_flight = None;
-                            result.terrain_revision == runtime.terrain_revision
+                            let result_is_current = result.terrain_revision
+                                == runtime.terrain_revision
                                 && result.far_generation == runtime.far_generation
-                                && result.chunks == runtime.far_chunks
                                 && runtime.build_queue.is_empty()
-                                && runtime.in_flight_chunks.is_empty()
+                                && runtime.in_flight_chunks.is_empty();
+                            let result_is_resident = result
+                                .chunks
+                                .iter()
+                                .all(|chunk| runtime.far_chunks.contains(chunk));
+                            if result_is_current && result_is_resident {
+                                for chunk in &result.chunks {
+                                    runtime
+                                        .far_pending_chunks
+                                        .retain(|pending| pending != chunk);
+                                }
+                                runtime.far_dirty = !runtime.far_pending_chunks.is_empty();
+                            }
+                            result_is_current && result_is_resident
                         }
                     };
                     if accepted {
                         self.install_far_mesh_result(result);
-                        self.runtime
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .far_dirty = false;
                         changed = true;
                     }
                 }
@@ -1034,20 +1158,36 @@ impl BoxcraftApp {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) =
             Some(Arc::clone(&result.visible_space));
-        let core_meshes = result.meshes;
-        let mut groups: HashMap<(i32, i32), Vec<Arc<boxcraft_core::Mesh>>> = HashMap::new();
-        for (chunk, core_mesh) in &core_meshes {
-            let group = (
-                chunk.0.div_euclid(FAR_MESH_GROUP_SIZE),
-                chunk.1.div_euclid(FAR_MESH_GROUP_SIZE),
-            );
-            groups.entry(group).or_default().push(Arc::clone(core_mesh));
-        }
-        let mut meshes = HashMap::with_capacity(groups.len());
+        let batch_meshes = result.meshes;
+        let changed_groups: HashSet<(i32, i32)> = batch_meshes
+            .keys()
+            .copied()
+            .map(far_group_for_chunk)
+            .collect();
+        self.far_core_meshes.update(|meshes| {
+            let mut next = (**meshes).clone();
+            for (chunk, core_mesh) in &batch_meshes {
+                next.insert(*chunk, Arc::clone(core_mesh));
+            }
+            *meshes = Arc::new(next);
+        });
+
+        // Only rebuild the group meshes touched by this batch. The remaining
+        // far groups already contain valid GPU handles and can stay resident.
+        let all_core_meshes = self.far_core_meshes.get();
         self.mesh_revision
             .update(|revision| *revision = revision.wrapping_add(1));
         let revision = self.mesh_revision.get();
-        for (group, core_meshes) in groups {
+        let mut rebuilt = HashMap::with_capacity(changed_groups.len());
+        for group in changed_groups.iter().copied() {
+            let core_meshes: Vec<Arc<boxcraft_core::Mesh>> = all_core_meshes
+                .iter()
+                .filter(|(chunk, _)| far_group_for_chunk(**chunk) == group)
+                .map(|(_, core_mesh)| Arc::clone(core_mesh))
+                .collect();
+            if core_meshes.is_empty() {
+                continue;
+            }
             let bounds = mesh_bounds_for_cores(
                 &core_meshes,
                 MeshBounds::fallback(
@@ -1089,7 +1229,7 @@ impl BoxcraftApp {
                     handle
                 }
             };
-            meshes.insert(
+            rebuilt.insert(
                 group,
                 Arc::new(TerrainMesh {
                     gpu: SgfxMesh::with_handle(handle, revision, vertices),
@@ -1098,9 +1238,31 @@ impl BoxcraftApp {
                 }),
             );
         }
-        self.far_core_meshes.set(Arc::new(core_meshes));
 
-        // Retire handles for groups that are no longer resident.
+        let desired_groups: HashSet<(i32, i32)> = self
+            .runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .far_chunks
+            .iter()
+            .copied()
+            .map(far_group_for_chunk)
+            .collect();
+        self.far_meshes.update(|meshes| {
+            let mut next = (**meshes).clone();
+            for group in &changed_groups {
+                if let Some(mesh) = rebuilt.get(group) {
+                    next.insert(*group, Arc::clone(mesh));
+                } else {
+                    next.remove(group);
+                }
+            }
+            next.retain(|group, _| desired_groups.contains(group));
+            *meshes = Arc::new(next);
+        });
+
+        // Retire handles for groups that no longer have resident geometry.
+        let resident_groups = self.far_meshes.get();
         let stale_handles: Vec<(i32, i32)> = {
             let handles = self
                 .far_handles
@@ -1109,7 +1271,7 @@ impl BoxcraftApp {
             handles
                 .keys()
                 .copied()
-                .filter(|group| !meshes.contains_key(group))
+                .filter(|group| !resident_groups.contains_key(group))
                 .collect()
         };
         if !stale_handles.is_empty() {
@@ -1128,7 +1290,6 @@ impl BoxcraftApp {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .extend(retired);
         }
-        self.far_meshes.set(Arc::new(meshes));
     }
 
     /// Keep the last complete canvas frame visible during a far-ring handoff.
@@ -1296,10 +1457,30 @@ impl BoxcraftApp {
             .reference_aspect(REFERENCE_ASPECT);
         let daylight = sunlight_daylight(sun_phase);
         let far_meshes = self.presented_far_meshes.get();
-        for (_, mesh) in far_meshes.iter().filter(|(_, mesh)| {
-            mesh.triangle_count() > 0
-                && chunk_is_visible(camera.position, camera.forward(), mesh.bounds, far_plane)
-        }) {
+        let near_meshes = self.presented_near_meshes.get();
+        let mut candidates: Vec<Arc<TerrainMesh>> = near_meshes
+            .values()
+            .chain(far_meshes.values())
+            .filter(|mesh| {
+                mesh.triangle_count() > 0
+                    && chunk_is_visible(camera.position, camera.forward(), mesh.bounds, far_plane)
+            })
+            .cloned()
+            .collect();
+        candidates.sort_by(|left, right| {
+            mesh_distance_sq(left.bounds, camera.position)
+                .partial_cmp(&mesh_distance_sq(right.bounds, camera.position))
+                .unwrap_or(core::cmp::Ordering::Equal)
+        });
+        let mut terrain_vertices: usize = 0;
+        for mesh in candidates {
+            let vertices = mesh.triangle_count().saturating_mul(3);
+            if vertices > MAX_TERRAIN_FRAME_VERTICES
+                || terrain_vertices.saturating_add(vertices) > MAX_TERRAIN_FRAME_VERTICES
+            {
+                continue;
+            }
+            terrain_vertices = terrain_vertices.saturating_add(vertices);
             let tint = if mesh.has_block_light {
                 Color::WHITE
             } else {
@@ -1307,22 +1488,6 @@ impl BoxcraftApp {
             };
             frame = frame.draw(
                 SgfxCanvasDraw::new(Arc::clone(&mesh.gpu), transform)
-                    .tint(tint)
-                    .texture(Arc::clone(&self.block_atlas)),
-            );
-        }
-        let near_meshes = self.presented_near_meshes.get();
-        for (_, meshes) in near_meshes.iter().filter(|(_, mesh)| {
-            mesh.triangle_count() > 0
-                && chunk_is_visible(camera.position, camera.forward(), mesh.bounds, far_plane)
-        }) {
-            let tint = if meshes.has_block_light {
-                Color::WHITE
-            } else {
-                Color::rgb(daylight, daylight, daylight)
-            };
-            frame = frame.draw(
-                SgfxCanvasDraw::new(Arc::clone(&meshes.gpu), transform)
                     .tint(tint)
                     .texture(Arc::clone(&self.block_atlas)),
             );
@@ -2027,6 +2192,62 @@ fn chunk_within_near_radius(
     (chunk.0 - player_chunk.0).abs() <= radius && (chunk.1 - player_chunk.1).abs() <= radius
 }
 
+fn chunk_stream_priority(
+    chunk: (i32, i32),
+    player_chunk: (i32, i32),
+    camera_position: Vec3,
+    camera_forward: Vec3,
+) -> f32 {
+    let center = Vec3::new(
+        chunk.0 as f32 * CHUNK_SIZE as f32 + CHUNK_SIZE as f32 * 0.5,
+        camera_position.y,
+        chunk.1 as f32 * CHUNK_SIZE as f32 + CHUNK_SIZE as f32 * 0.5,
+    );
+    let offset = center - camera_position;
+    let distance = offset.length().max(CHUNK_SIZE as f32);
+    let horizontal_offset = Vec3::new(offset.x, 0.0, offset.z);
+    let horizontal_forward = Vec3::new(camera_forward.x, 0.0, camera_forward.z).normalized();
+    let alignment = if horizontal_offset.length() <= f32::EPSILON
+        || horizontal_forward.length() <= f32::EPSILON
+    {
+        1.0
+    } else {
+        horizontal_offset
+            .normalized()
+            .dot(horizontal_forward)
+            .clamp(-1.0, 1.0)
+    };
+    let chebyshev_distance = (chunk.0 - player_chunk.0)
+        .abs()
+        .max((chunk.1 - player_chunk.1).abs()) as f32;
+    // Keep nearby chunks ahead of distant ones, then prefer the half-space
+    // the camera faces. This reduces turn-time stalls without creating a
+    // directional hole around the player.
+    chebyshev_distance * 16.0 + distance * (1.0 + (1.0 - alignment.max(0.0)) * 0.75)
+}
+
+fn far_group_for_chunk(chunk: (i32, i32)) -> (i32, i32) {
+    (
+        chunk.0.div_euclid(FAR_MESH_GROUP_SIZE),
+        chunk.1.div_euclid(FAR_MESH_GROUP_SIZE),
+    )
+}
+
+fn far_group_stream_priority(
+    chunk: (i32, i32),
+    player_chunk: (i32, i32),
+    camera_position: Vec3,
+    camera_forward: Vec3,
+) -> f32 {
+    let group = far_group_for_chunk(chunk);
+    chunk_stream_priority(
+        (group.0 * FAR_MESH_GROUP_SIZE, group.1 * FAR_MESH_GROUP_SIZE),
+        player_chunk,
+        camera_position,
+        camera_forward,
+    )
+}
+
 fn should_hold_presented_terrain(far_dirty: bool, has_presented_far_ring: bool) -> bool {
     far_dirty && has_presented_far_ring
 }
@@ -2078,6 +2299,11 @@ fn mesh_bounds_for_cores(meshes: &[Arc<boxcraft_core::Mesh>], fallback: MeshBoun
 fn camera_far_plane(render_distance: i32) -> f32 {
     let diameter = (render_distance.max(1) + 1) as f32 * CHUNK_SIZE as f32;
     (diameter * core::f32::consts::SQRT_2 + CHUNK_SIZE as f32).max(128.0)
+}
+
+fn mesh_distance_sq(bounds: MeshBounds, camera_position: Vec3) -> f32 {
+    let offset = (bounds.min + bounds.max) * 0.5 - camera_position;
+    offset.dot(offset)
 }
 
 /// Return whether a mesh's world-space AABB can intersect the camera frustum.

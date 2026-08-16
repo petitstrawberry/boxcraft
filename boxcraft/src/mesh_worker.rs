@@ -133,6 +133,15 @@ impl MeshWorkers {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .pop_front()
     }
+
+    #[cfg_attr(not(target_os = "scarlet"), allow(dead_code))]
+    pub fn defer(&self, result: MeshResult) {
+        self.shared
+            .results
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push_front(result);
+    }
 }
 
 fn worker_loop(shared: Arc<Shared>) {

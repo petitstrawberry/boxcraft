@@ -116,6 +116,7 @@ name = "boxcraft"
 version = "0.1.0"
 dependencies = [
  "boxcraft-core",
+ "scarlet-sys",
  "scarlet-ui",
 ]
 

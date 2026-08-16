@@ -1,9 +1,12 @@
 //! ScarletUI frontend for Boxcraft.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+#[cfg(target_os = "scarlet")]
+use scarlet_sys::{Syscall, syscall3};
 
 use boxcraft_core::{
     Block, CHUNK_SIZE, Game, IVec3, LightUpdate, Mat4, PlayerInput, Vec3, VisibleSpace, World,
@@ -25,7 +28,6 @@ const REFERENCE_ASPECT: f32 = 16.0 / 9.0;
 const CAMERA_FOV: f32 = 70.0_f32.to_radians();
 const REACH: f32 = 6.0;
 const LOOK_SENSITIVITY: f32 = 0.003;
-const WORLD_SEED: u64 = 0xB0CA_FE00_2026_0001;
 const ATLAS_TILE_SIZE: u32 = 32;
 const ATLAS_COLUMNS: u32 = 4;
 const ATLAS_ROWS: u32 = 4;
@@ -36,15 +38,17 @@ const SUNLIGHT_UPDATES_PER_SECOND: f32 = 4.0;
 const MAX_IN_FLIGHT_NEAR_JOBS: usize = WORKER_COUNT * 2;
 const MAX_MESH_RESULTS_PER_IDLE: usize = 2;
 /// Default and inclusive bounds for the configurable render distance.
-const DEFAULT_RENDER_DISTANCE: i32 = 3;
+const DEFAULT_RENDER_DISTANCE: i32 = 5;
 const MIN_RENDER_DISTANCE: i32 = 1;
-const MAX_RENDER_DISTANCE: i32 = 6;
+const MAX_RENDER_DISTANCE: i32 = 12;
 /// Chunks within this Chebyshev radius keep individual meshes for edits. Each
 /// chunk now has one textured draw; illumination is carried by its vertices.
 const NEAR_CHUNK_RADIUS: i32 = 2;
 /// Far meshes combine a small tile of chunks to keep SGFX draw-state commands
 /// below its opaque command-stream limit while retaining coarse culling.
 const FAR_MESH_GROUP_SIZE: i32 = 2;
+
+static NEXT_WORLD_SEED: AtomicU64 = AtomicU64::new(0xB0CA_FE00_2026_0001);
 
 /// Run the Boxcraft application.
 ///
@@ -173,7 +177,8 @@ struct BoxcraftApp {
 
 impl BoxcraftApp {
     fn new() -> Self {
-        let initial_game = Game::generated(WORLD_SEED);
+        let seed = random_world_seed();
+        let initial_game = Game::generated(seed);
         let mesh_world = Arc::new(Mutex::new(Arc::new(initial_game.world.clone())));
         let initial_frame = Arc::new(
             SgfxCanvasFrame::new(0, sky_color(0.0))
@@ -183,7 +188,7 @@ impl BoxcraftApp {
         let app = Self {
             game: State::new(StateId::new(1), Arc::new(Mutex::new(initial_game))),
             keys: State::new(StateId::new(2), PressedKeys::default()),
-            seed: State::new(StateId::new(3), WORLD_SEED),
+            seed: State::new(StateId::new(3), seed),
             pointer_lock_desired: State::new(StateId::new(4), false),
             pointer_lock_applied: State::new(StateId::new(5), false),
             pointer_lock_pending: State::new(StateId::new(6), false),
@@ -322,8 +327,8 @@ impl BoxcraftApp {
     }
 
     fn reset_world(&self) {
-        self.seed.update(|seed| *seed = seed.wrapping_add(1));
-        let seed = self.seed.get();
+        let seed = random_world_seed();
+        self.seed.set(seed);
         let game = Game::generated(seed);
         *self
             .mesh_world
@@ -1513,6 +1518,51 @@ impl Application for BoxcraftApp {
 
 fn build_boxcraft_content(app: &BoxcraftApp) -> Box<dyn View> {
     Box::new(app.content())
+}
+
+/// Produce a different terrain seed for every launch and reset.
+///
+/// World seeds are not security-sensitive, so the wall clock is combined with
+/// a process-local sequence and an address-derived value. The latter keeps the
+/// fallback useful on guests without an initialized RTC as well.
+fn random_world_seed() -> u64 {
+    let os_entropy = scarlet_random_u64();
+    let clock = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() as u64)
+        .unwrap_or(0);
+    let sequence = NEXT_WORLD_SEED.fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed);
+    let address = (&clock as *const u64 as usize) as u64;
+    let mut seed = os_entropy ^ clock ^ sequence.rotate_left(17) ^ address.rotate_right(11);
+    seed = (seed ^ (seed >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    seed = (seed ^ (seed >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    let seed = seed ^ (seed >> 31);
+    if seed == 0 {
+        0xB0CA_FE00_2026_0001
+    } else {
+        seed
+    }
+}
+
+#[cfg(target_os = "scarlet")]
+fn scarlet_random_u64() -> u64 {
+    let mut bytes = [0_u8; 8];
+    let result = syscall3(
+        Syscall::GetRandom,
+        bytes.as_mut_ptr() as usize,
+        bytes.len(),
+        0,
+    );
+    if result == bytes.len() {
+        u64::from_le_bytes(bytes)
+    } else {
+        0
+    }
+}
+
+#[cfg(not(target_os = "scarlet"))]
+fn scarlet_random_u64() -> u64 {
+    0
 }
 
 /// Convert one terrain chunk into a single textured mesh with interpolated

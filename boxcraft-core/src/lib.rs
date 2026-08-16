@@ -428,7 +428,12 @@ impl Block {
 }
 
 /// Height of the still-water surface in generated worlds.
-pub const SEA_LEVEL: i32 = 5;
+pub const SEA_LEVEL: i32 = 12;
+
+/// Default generated-world dimensions in voxels.
+pub const DEFAULT_WORLD_WIDTH: usize = 384;
+pub const DEFAULT_WORLD_HEIGHT: usize = 96;
+pub const DEFAULT_WORLD_DEPTH: usize = 384;
 
 /// Horizontal size of one renderable terrain chunk, in voxels.
 pub const CHUNK_SIZE: i32 = 16;
@@ -632,13 +637,17 @@ impl World {
         }
     }
 
-    /// Creates the default world used by the game (192 by 48 by 192).
+    /// Creates the default world used by the game (384 by 96 by 384).
     ///
     /// # Returns
     ///
-    /// A 192 by 48 by 192 all-air world.
+    /// A 384 by 96 by 384 all-air world.
     pub fn default_sized() -> Self {
-        Self::new(192, 48, 192)
+        Self::new(
+            DEFAULT_WORLD_WIDTH,
+            DEFAULT_WORLD_HEIGHT,
+            DEFAULT_WORLD_DEPTH,
+        )
     }
 
     /// Generates deterministic terrain from `seed`, including coasts and trees.
@@ -651,7 +660,12 @@ impl World {
     ///
     /// A default-sized world whose terrain is entirely determined by `seed`.
     pub fn generate(seed: u64) -> Self {
-        Self::generate_sized(seed, 192, 48, 192)
+        Self::generate_sized(
+            seed,
+            DEFAULT_WORLD_WIDTH,
+            DEFAULT_WORLD_HEIGHT,
+            DEFAULT_WORLD_DEPTH,
+        )
     }
 
     /// Generates deterministic terrain for an explicitly sized world.
@@ -2149,7 +2163,8 @@ fn hash(seed: u64, x: i32, z: i32) -> u64 {
 }
 
 /// The height of the snow line; peaks above this are covered in snow.
-const SNOW_LINE: i32 = 31;
+const SNOW_LINE: i32 = 69;
+const TERRAIN_MAX_HEIGHT: i32 = 91;
 
 /// A generated vertical terrain profile plus its surface materials.
 #[derive(Clone, Copy, Debug)]
@@ -2174,8 +2189,8 @@ enum Biome {
 
 fn terrain_column(seed: u64, x: i32, z: i32) -> TerrainColumn {
     let height = terrain_height(seed, x, z);
-    let temperature = fbm(seed ^ 0x1D3E_5A6B_7C8D_9E0F, x, z, 40, 2);
-    let moisture = fbm(seed ^ 0x2C4F_6E80_91A2_B3C4, x, z, 32, 2);
+    let temperature = fbm(seed ^ 0x1D3E_5A6B_7C8D_9E0F, x, z, 96, 3);
+    let moisture = fbm(seed ^ 0x2C4F_6E80_91A2_B3C4, x, z, 72, 3);
     let (biome, surface, subsurface) = if height <= SEA_LEVEL - 2 {
         (Biome::Ocean, Block::Sand, Block::Sand)
     } else if height <= SEA_LEVEL + 1 {
@@ -2207,38 +2222,54 @@ fn terrain_column(seed: u64, x: i32, z: i32) -> TerrainColumn {
     }
 }
 
-/// Returns the terrain surface height at a column, from 1 to 43.
+/// Returns the terrain surface height at a column, from 1 to 91.
 pub fn terrain_height(seed: u64, x: i32, z: i32) -> i32 {
-    // Domain warping bends the whole noise field so ranges and coastlines
-    // curve naturally instead of forming axis-aligned blobs.
-    let warp_x = fbm(seed ^ 0x6A09_E667_F3BC_C908, x, z, 36, 2) * 22.0;
-    let warp_z = fbm(seed ^ 0xBB67_AE85_84CA_A73B, x, z, 36, 2) * 22.0;
+    // Domain warping bends the whole noise field so continents, river beds,
+    // and mountain belts curve naturally instead of forming axis-aligned
+    // blobs. The larger wavelength keeps the new world from becoming a
+    // repeating collection of small hills.
+    let warp_x = fbm(seed ^ 0x6A09_E667_F3BC_C908, x, z, 72, 3) * 34.0;
+    let warp_z = fbm(seed ^ 0xBB67_AE85_84CA_A73B, x, z, 72, 3) * 34.0;
     let wx = x as f32 + warp_x;
     let wz = z as f32 + warp_z;
 
-    // Broad continents establish oceans, shelves and land masses.
-    let continent = fbm_at(seed ^ 0xF135_7AEA_2E62_A9C5, wx, wz, 56, 3);
-    // Rolling hills composed of several octaves of warped value noise.
-    let hills = fbm_at(seed ^ 0x8D58_AC26_AA16_3A41, wx, wz, 14, 4) * 5.5;
-    // Ridged noise creates sharp alpine crests where a regional mask allows.
-    let mountain_mask = smoothstep(
-        (((fbm_at(seed ^ 0x7B29_4D0F_91D7_05B3, wx, wz, 64, 2) + 1.0) * 0.5 - 0.30) / 0.30)
-            .clamp(0.0, 1.0),
-    );
-    let ridge = (1.0 - fbm_at(seed ^ 0x4CF5_AD43_2745_937F, wx, wz, 28, 3).abs()).powi(3) * 32.0;
+    // Broad continental noise establishes deep oceans, shelves, and land
+    // masses. Independent hill noise then gives the coast and inland plains
+    // a different scale from the mountain systems.
+    let continent = fbm_at(seed ^ 0xF135_7AEA_2E62_A9C5, wx, wz, 128, 4);
+    let hills = fbm_at(seed ^ 0x8D58_AC26_AA16_3A41, wx, wz, 30, 5) * 9.0;
+    let detail = fbm_at(seed ^ 0xD1B5_4A32_97E0_C6F8, wx, wz, 10, 3) * 2.5;
 
-    let elevation = SEA_LEVEL as f32 + 2.2 + continent * 7.0 + hills + ridge * mountain_mask;
-    elevation.round().clamp(1.0, 43.0) as i32
+    // A broad regional mask creates mountain belts. Ridged noise supplies
+    // the individual crests, while erosion cuts valleys back into them.
+    let mountain_region = fbm_at(seed ^ 0x7B29_4D0F_91D7_05B3, wx, wz, 96, 3);
+    let mountain_mask = smoothstep(((mountain_region - 0.15) / 0.45).clamp(0.0, 1.0));
+    let ridge = (1.0 - fbm_at(seed ^ 0x4CF5_AD43_2745_937F, wx, wz, 42, 4).abs()).powi(3);
+    let ridge_height = ridge * mountain_mask * 50.0;
+    let erosion = fbm_at(seed ^ 0xA54F_F53A_1B7E_9C21, wx, wz, 70, 3);
+    let valley_cut = ((-erosion - 0.24) / 0.76).clamp(0.0, 1.0) * mountain_mask * 8.0;
+
+    // Narrow low-frequency noise bands form winding river valleys. Lowering
+    // them through the water table lets the existing water fill logic create
+    // lakes and streams without adding a second fluid-generation pass.
+    let river_signal = fbm_at(seed ^ 0xC6EF_372F_91A8_5D40, wx, wz, 54, 3).abs();
+    let river_mask = (1.0 - river_signal / 0.12).clamp(0.0, 1.0).powi(2);
+    let river_cut = river_mask * (1.5 + mountain_mask * 5.0);
+
+    let elevation = SEA_LEVEL as f32 + 3.0 + continent * 13.0 + hills + detail + ridge_height
+        - valley_cut
+        - river_cut;
+    elevation.round().clamp(1.0, TERRAIN_MAX_HEIGHT as f32) as i32
 }
 
 /// Returns whether a 3D noise sample opens a cave tunnel at this cell.
 fn is_cave(seed: u64, x: i32, y: i32, z: i32) -> bool {
     // Two independent ridged fields intersected produce winding tunnels
     // rather than noisy blobs: a cave exists only where both are near zero.
-    let tunnel_a = value_noise_3d(seed ^ 0x3A7B_2D4E_6F80_91A2, x, y * 2, z, 18);
-    let tunnel_b = value_noise_3d(seed ^ 0x5C9E_1F30_7153_B4D6, x, y * 2, z, 18);
-    let room = value_noise_3d(seed ^ 0x6E80_91A2_B3C4_D5E6, x, y, z, 12);
-    tunnel_a.abs() < 0.085 && tunnel_b.abs() < 0.085 || room > 0.72
+    let tunnel_a = value_noise_3d(seed ^ 0x3A7B_2D4E_6F80_91A2, x, y * 2, z, 28);
+    let tunnel_b = value_noise_3d(seed ^ 0x5C9E_1F30_7153_B4D6, x, y * 2, z, 28);
+    let room = value_noise_3d(seed ^ 0x6E80_91A2_B3C4_D5E6, x, y, z, 20);
+    tunnel_a.abs() < 0.10 && tunnel_b.abs() < 0.10 || room > 0.78
 }
 
 fn fbm(seed: u64, x: i32, z: i32, wavelength: i32, octaves: u32) -> f32 {
@@ -2357,8 +2388,9 @@ fn initial_t(origin: f32, direction: f32, step: i32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        Block, CHUNK_SIZE, IVec3, Mat4, Mesh, Player, PlayerInput, SEA_LEVEL, Vec3, VisibleSpace,
-        World, mesh_chunk, mesh_chunk_lod, mesh_world, terrain_height,
+        Block, CHUNK_SIZE, DEFAULT_WORLD_DEPTH, DEFAULT_WORLD_HEIGHT, DEFAULT_WORLD_WIDTH, IVec3,
+        Mat4, Mesh, Player, PlayerInput, SEA_LEVEL, Vec3, VisibleSpace, World, mesh_chunk,
+        mesh_chunk_lod, mesh_world, terrain_height,
     };
 
     #[test]
@@ -2371,6 +2403,14 @@ mod tests {
     fn generated_terrain_is_bounded_and_includes_a_coastline() {
         let world = World::generate(42);
         let (width, height, depth) = world.dimensions();
+        assert_eq!(
+            (width, height, depth),
+            (
+                DEFAULT_WORLD_WIDTH,
+                DEFAULT_WORLD_HEIGHT,
+                DEFAULT_WORLD_DEPTH
+            )
+        );
         let mut water = 0;
         let mut sand = 0;
         for z in 0..depth as i32 {
@@ -2396,10 +2436,10 @@ mod tests {
 
     #[test]
     fn terrain_uses_multiple_smooth_height_octaves_and_natural_trees() {
-        let mut levels = [false; 44];
+        let mut levels = [false; 92];
         let mut heights = Vec::new();
-        for z in 0..96 {
-            for x in 0..96 {
+        for z in 0..DEFAULT_WORLD_DEPTH as i32 {
+            for x in 0..DEFAULT_WORLD_WIDTH as i32 {
                 let height = terrain_height(42, x, z);
                 heights.push(height);
                 levels[height as usize] = true;
@@ -2407,7 +2447,11 @@ mod tests {
         }
         assert!(levels.into_iter().filter(|present| *present).count() >= 12);
         // Alpine relief must exist alongside the gentle coastal plains.
-        assert!(heights.iter().max().copied().unwrap() >= 30);
+        assert!(
+            heights.iter().max().copied().unwrap() >= 60,
+            "expanded terrain peak was only {}",
+            heights.iter().max().copied().unwrap()
+        );
 
         let world = World::generate(42);
         let wood = world

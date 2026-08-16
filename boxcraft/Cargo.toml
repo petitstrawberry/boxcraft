@@ -10,6 +10,7 @@ boxcraft-core = { path = "../boxcraft-core" }
 
 [target.'cfg(target_os = "scarlet")'.dependencies]
 scarlet-ui = { git = "https://github.com/petitstrawberry/scarlet-ui", branch = "main", package = "scarlet-ui", default-features = false, features = ["std", "platform-sws"] }
+scarlet-sys = { git = "https://github.com/petitstrawberry/Scarlet", branch = "dev", package = "scarlet-sys" }
 
 [[bin]]
 name = "boxcraft"

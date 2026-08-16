@@ -1,6 +1,7 @@
 //! ScarletUI frontend for Boxcraft.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -164,6 +165,8 @@ struct BoxcraftApp {
     block_atlas: Arc<SgfxTexture>,
     runtime: Arc<Mutex<Runtime>>,
     mesh_world: Arc<Mutex<Arc<World>>>,
+    pending_mouse_dx: Arc<AtomicI32>,
+    pending_mouse_dy: Arc<AtomicI32>,
     mesh_workers: MeshWorkers,
 }
 
@@ -232,6 +235,8 @@ impl BoxcraftApp {
             block_atlas: block_texture_atlas(),
             runtime: Arc::new(Mutex::new(Runtime::new())),
             mesh_world,
+            pending_mouse_dx: Arc::new(AtomicI32::new(0)),
+            pending_mouse_dy: Arc::new(AtomicI32::new(0)),
             mesh_workers: MeshWorkers::new(),
         };
         app.refresh_chunk_set();
@@ -271,6 +276,18 @@ impl BoxcraftApp {
         self.keys.set(PressedKeys::default());
     }
 
+    fn clear_pending_mouse_delta(&self) {
+        self.pending_mouse_dx.store(0, Ordering::Relaxed);
+        self.pending_mouse_dy.store(0, Ordering::Relaxed);
+    }
+
+    fn take_pending_mouse_delta(&self) -> (i32, i32) {
+        (
+            self.pending_mouse_dx.swap(0, Ordering::Relaxed),
+            self.pending_mouse_dy.swap(0, Ordering::Relaxed),
+        )
+    }
+
     fn request_pointer_lock(&self) {
         self.pointer_lock_desired.set(true);
         self.status.set(String::from("Requesting pointer capture…"));
@@ -279,6 +296,7 @@ impl BoxcraftApp {
     fn release_pointer_lock(&self) {
         self.pointer_lock_desired.set(false);
         self.clear_pressed_keys();
+        self.clear_pending_mouse_delta();
         self.status
             .set(String::from("Pointer released — UI controls are available"));
     }
@@ -312,6 +330,7 @@ impl BoxcraftApp {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::new(game.world.clone());
         self.game.set(Arc::new(Mutex::new(game)));
         self.clear_pressed_keys();
+        self.clear_pending_mouse_delta();
         let retired: Vec<SgfxMeshHandle> = {
             let mut handles = self
                 .chunk_handles
@@ -476,12 +495,20 @@ impl BoxcraftApp {
         if !self.pointer_lock_applied.get() {
             return;
         }
-        self.with_game(|game| {
-            game.player.look(
-                dx as f32 * LOOK_SENSITIVITY,
-                -(dy as f32) * LOOK_SENSITIVITY,
-            );
-        });
+        // Relative-motion events can arrive several times per frame. Keep
+        // input handling cheap and let on_idle apply one combined rotation,
+        // just like keyboard movement. Saturation prevents a stuck device
+        // from wrapping the accumulated delta.
+        let _ =
+            self.pending_mouse_dx
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |pending| {
+                    Some(pending.saturating_add(dx))
+                });
+        let _ =
+            self.pending_mouse_dy
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |pending| {
+                    Some(pending.saturating_add(dy))
+                });
     }
 
     fn handle_mouse_button(&self, button: MouseButton, pressed: bool) -> bool {
@@ -1373,6 +1400,7 @@ impl Application for BoxcraftApp {
             self.status.set(String::from("Pointer captured"));
         } else {
             self.clear_pressed_keys();
+            self.clear_pending_mouse_delta();
             self.status
                 .set(String::from("Pointer released — UI controls are available"));
         }
@@ -1398,6 +1426,7 @@ impl Application for BoxcraftApp {
 
     fn on_focus_changed(&mut self, _window_id: u32, _app_name: &str, _menu_titles: &str) {
         self.clear_pressed_keys();
+        self.clear_pending_mouse_delta();
     }
 
     fn on_idle(&mut self) {
@@ -1423,6 +1452,15 @@ impl Application for BoxcraftApp {
 
         let input = self.keys.get().player_input();
         let previous_camera = self.with_game(|game| game.player.camera());
+        let (mouse_dx, mouse_dy) = self.take_pending_mouse_delta();
+        if mouse_dx != 0 || mouse_dy != 0 {
+            self.with_game(|game| {
+                game.player.look(
+                    mouse_dx as f32 * LOOK_SENSITIVITY,
+                    -(mouse_dy as f32) * LOOK_SENSITIVITY,
+                );
+            });
+        }
         self.with_game(|game| {
             game.player.step(&game.world, input, delta_seconds);
             if game.player.position.y < -4.0 {

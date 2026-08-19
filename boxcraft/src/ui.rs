@@ -1,4 +1,4 @@
-//! ScarletUI frontend for Boxcraft.
+//! Cross-platform ScarletUI frontend for Boxcraft.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
@@ -1788,7 +1788,7 @@ fn build_boxcraft_content(app: &BoxcraftApp) -> Box<dyn View> {
 /// a process-local sequence and an address-derived value. The latter keeps the
 /// fallback useful on guests without an initialized RTC as well.
 fn random_world_seed() -> u64 {
-    let os_entropy = scarlet_random_u64();
+    let os_entropy = platform_entropy_u64();
     let clock = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos() as u64)
@@ -1807,7 +1807,7 @@ fn random_world_seed() -> u64 {
 }
 
 #[cfg(target_os = "scarlet")]
-fn scarlet_random_u64() -> u64 {
+fn platform_entropy_u64() -> u64 {
     let mut bytes = [0_u8; 8];
     let result = syscall3(
         Syscall::GetRandom,
@@ -1823,7 +1823,7 @@ fn scarlet_random_u64() -> u64 {
 }
 
 #[cfg(not(target_os = "scarlet"))]
-fn scarlet_random_u64() -> u64 {
+fn platform_entropy_u64() -> u64 {
     0
 }
 

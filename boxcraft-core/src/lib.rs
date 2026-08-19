@@ -1106,8 +1106,37 @@ impl World {
     }
 
     /// Incrementally refresh both light channels after one block edit.
+    ///
+    /// # Arguments
+    ///
+    /// * `center` - Edited voxel whose light neighbourhood must be refreshed.
+    ///
+    /// # Returns
+    ///
+    /// Horizontal bounds of cells whose final sky or block light changed.
     pub fn recompute_light_after_edit(&mut self, center: IVec3) -> LightUpdate {
-        let Some(center_index) = self.index(center) else {
+        self.recompute_light_after_edits(core::slice::from_ref(&center))
+    }
+
+    /// Incrementally refresh both light channels after a batch of block edits.
+    ///
+    /// Direct-sky columns and propagation queues are shared across the batch,
+    /// avoiding one complete relaxation pass per click during rapid editing.
+    ///
+    /// # Arguments
+    ///
+    /// * `centers` - Edited voxels whose light neighbourhoods must be refreshed.
+    ///
+    /// # Returns
+    ///
+    /// Horizontal bounds of cells whose final sky or block light changed.
+    pub fn recompute_light_after_edits(&mut self, centers: &[IVec3]) -> LightUpdate {
+        let centers: Vec<(IVec3, usize)> = centers
+            .iter()
+            .copied()
+            .filter_map(|center| self.index(center).map(|index| (center, index)))
+            .collect();
+        let Some(&(first_center, _)) = centers.first() else {
             return LightUpdate::empty();
         };
         if !self.lighting_initialized {
@@ -1123,14 +1152,27 @@ impl World {
 
         let mut changed = LightUpdate::empty();
         let mut queue = std::collections::VecDeque::new();
-        let mut sunlight_source_bounds = LightBounds::around(center);
-        self.refresh_direct_sunlight_after_edit(center, &mut queue, &mut sunlight_source_bounds);
+        let mut sunlight_source_bounds = LightBounds::around(first_center);
+        for &(center, _) in &centers {
+            sunlight_source_bounds.include(center);
+            self.refresh_direct_sunlight_after_edit(
+                center,
+                &mut queue,
+                &mut sunlight_source_bounds,
+            );
+        }
         let sunlight_bounds = sunlight_source_bounds.expanded(LIGHT_PROPAGATION_RADIUS);
-        Self::enqueue_light(&mut queue, &mut self.light_queue_pending, center_index);
+        for &(_, center_index) in &centers {
+            Self::enqueue_light(&mut queue, &mut self.light_queue_pending, center_index);
+        }
         self.relax_sunlight(&mut queue, &mut changed, sunlight_bounds);
 
-        let block_light_bounds = LightBounds::around(center).expanded(LIGHT_PROPAGATION_RADIUS);
-        Self::enqueue_light(&mut queue, &mut self.light_queue_pending, center_index);
+        let mut block_light_bounds = LightBounds::around(first_center);
+        for &(center, center_index) in &centers {
+            block_light_bounds.include(center);
+            Self::enqueue_light(&mut queue, &mut self.light_queue_pending, center_index);
+        }
+        let block_light_bounds = block_light_bounds.expanded(LIGHT_PROPAGATION_RADIUS);
         self.relax_block_light(&mut queue, &mut changed, block_light_bounds);
         debug_assert!(self.light_queue_pending.iter().all(|pending| *pending == 0));
         changed
@@ -1604,10 +1646,10 @@ const GREEDY_FACE_SPECS: [GreedyFaceSpec; 6] = [
     GreedyFaceSpec {
         normal: IVec3::new(0, -1, 0),
         base: Vec3::new(0.0, 0.0, 1.0),
-        u: Vec3::new(1.0, 0.0, 0.0),
-        v: Vec3::new(0.0, 0.0, -1.0),
-        u_axis: 0,
-        v_axis: 2,
+        u: Vec3::new(0.0, 0.0, -1.0),
+        v: Vec3::new(1.0, 0.0, 0.0),
+        u_axis: 2,
+        v_axis: 0,
     },
     GreedyFaceSpec {
         normal: IVec3::new(0, 1, 0),
@@ -2969,9 +3011,9 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        Block, CHUNK_SIZE, DEFAULT_WORLD_DEPTH, DEFAULT_WORLD_HEIGHT, DEFAULT_WORLD_WIDTH, IVec3,
-        Mat4, Mesh, Player, PlayerInput, SEA_LEVEL, Vec3, VisibleSpace, World, mesh_chunk,
-        mesh_chunk_lod, mesh_region_greedy, mesh_world, terrain_height,
+        Block, CHUNK_SIZE, DEFAULT_WORLD_DEPTH, DEFAULT_WORLD_HEIGHT, DEFAULT_WORLD_WIDTH,
+        GREEDY_FACE_SPECS, IVec3, Mat4, Mesh, Player, PlayerInput, SEA_LEVEL, Vec3, VisibleSpace,
+        World, mesh_chunk, mesh_chunk_lod, mesh_region_greedy, mesh_world, terrain_height,
     };
 
     #[test]
@@ -3202,6 +3244,29 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn batched_light_edits_match_a_full_recompute() {
+        let mut world = World::generate_sized(0xBA7C, 32, 20, 32);
+        let edits = [
+            (IVec3::new(16, 15, 16), Block::Stone),
+            (IVec3::new(16, 14, 16), Block::Air),
+            (IVec3::new(8, 8, 20), Block::Torch),
+            (IVec3::new(24, 10, 6), Block::Water),
+        ];
+        for &(position, block) in &edits {
+            world.set(position, block);
+        }
+
+        let mut reference = world.clone();
+        reference.recompute_light();
+        let positions = edits.map(|(position, _)| position);
+        world.recompute_light_after_edits(&positions);
+
+        assert_eq!(world.direct_sunlight, reference.direct_sunlight);
+        assert_eq!(world.sunlight, reference.sunlight);
+        assert_eq!(world.block_light, reference.block_light);
     }
 
     #[test]
@@ -3446,6 +3511,22 @@ mod tests {
         let greedy = mesh_region_greedy(&world, 0, 15, 0, 15, None);
         assert!(greedy.vertices.len() < regular.vertices.len() / 4);
         assert_eq!(greedy.indices.len(), greedy.vertices.len() / 4 * 6);
+    }
+
+    #[test]
+    fn greedy_faces_use_outward_counter_clockwise_winding() {
+        for spec in GREEDY_FACE_SPECS {
+            let normal = Vec3::new(
+                spec.normal.x as f32,
+                spec.normal.y as f32,
+                spec.normal.z as f32,
+            );
+            assert!(
+                spec.u.cross(spec.v).dot(normal) > 0.0,
+                "greedy face {:?} has inward winding",
+                spec.normal
+            );
+        }
     }
 
     #[test]

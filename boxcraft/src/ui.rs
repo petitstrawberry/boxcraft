@@ -1,4 +1,4 @@
-//! ScarletUI frontend for Boxcraft.
+//! Cross-platform ScarletUI frontend for Boxcraft.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
@@ -10,7 +10,7 @@ use scarlet_sys::{Syscall, syscall3};
 
 use boxcraft_core::{
     Block, CHUNK_SIZE, DEFAULT_WORLD_HEIGHT, Game, IVec3, LightUpdate, Mat4, PlayerInput, Vec3,
-    VisibleSpace, World,
+    VisibleSpace, World, mesh_chunk,
 };
 use scarlet_ui::prelude::*;
 use scarlet_ui::{
@@ -19,7 +19,9 @@ use scarlet_ui::{
     SgfxMeshHandle, SgfxTexture, hstack, vstack, zstack,
 };
 
-use crate::mesh_worker::{FarMeshResult, MeshJob, MeshResult, MeshWorkers, WORKER_COUNT};
+use crate::mesh_worker::{
+    FarMeshResult, LightEdit, MeshJob, MeshResult, MeshWorkers, WORKER_COUNT,
+};
 
 const APP_ID: &str = "org.scarlet-os.boxcraft";
 const WINDOW_WIDTH: f32 = 1100.0;
@@ -41,9 +43,6 @@ const MAX_MESH_RESULTS_PER_IDLE: usize = 2;
 /// One oversized result is still allowed through so a single chunk cannot
 /// starve forever, but a burst of streamed chunks is spread over later ticks.
 const MAX_MESH_UPLOAD_VERTICES_PER_IDLE: usize = 60_000;
-/// Stay below ScarletUI SGFX's frame vertex ceiling and leave headroom for
-/// future canvas overlays. Near terrain is selected before distant terrain.
-const MAX_TERRAIN_FRAME_VERTICES: usize = 180_000;
 /// Default and inclusive bounds for the configurable render distance.
 const DEFAULT_RENDER_DISTANCE: i32 = 5;
 const MIN_RENDER_DISTANCE: i32 = 1;
@@ -107,6 +106,7 @@ struct Runtime {
     far_generation: u64,
     far_job_in_flight: Option<u64>,
     edit_job_in_flight: Option<u64>,
+    pending_light_edits: Vec<LightEdit>,
 }
 
 impl Runtime {
@@ -130,6 +130,7 @@ impl Runtime {
             far_generation: 0,
             far_job_in_flight: None,
             edit_job_in_flight: None,
+            pending_light_edits: Vec::new(),
         }
     }
 }
@@ -425,6 +426,7 @@ impl BoxcraftApp {
             runtime.far_generation = runtime.far_generation.wrapping_add(1);
             runtime.far_job_in_flight = None;
             runtime.edit_job_in_flight = None;
+            runtime.pending_light_edits.clear();
         }
         self.refresh_chunk_set();
         self.update_hud();
@@ -593,17 +595,39 @@ impl BoxcraftApp {
         true
     }
 
-    /// Queue a copy-on-write world edit so the input and presentation paths do
-    /// not wait for light propagation or mesh rebuilding.
+    /// Apply geometry immediately, then replace the pending background light
+    /// snapshot so rendering never waits for propagation to finish.
     fn submit_edit(&self, request: EditRequest) {
-        let (id, terrain_revision) = {
+        let current_world = Arc::clone(
+            &self
+                .mesh_world
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        if current_world.block(request.position) == Some(request.block) {
+            return;
+        }
+        let mut next_world = (*current_world).clone();
+        if !next_world.set(request.position, request.block) {
+            return;
+        }
+        let next_world = Arc::new(next_world);
+        *self
+            .mesh_world
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::clone(&next_world);
+        self.with_game(|game| game.world = Arc::clone(&next_world));
+        self.rebuild_immediate_edit_chunks(&next_world, request.position);
+
+        let edit = LightEdit {
+            position: request.position,
+            topology_changed: request.topology_changed,
+        };
+        let (id, terrain_revision, edits) = {
             let mut runtime = self
                 .runtime
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if runtime.edit_job_in_flight.is_some() {
-                return;
-            }
             runtime.next_mesh_job_id = runtime.next_mesh_job_id.wrapping_add(1);
             let id = runtime.next_mesh_job_id;
             runtime.terrain_revision = runtime.terrain_revision.wrapping_add(1);
@@ -612,32 +636,27 @@ impl BoxcraftApp {
             runtime.in_flight_chunks.clear();
             runtime.far_job_in_flight = None;
             runtime.edit_job_in_flight = Some(id);
-            (id, runtime.terrain_revision)
+            runtime.pending_light_edits.push(edit);
+            (
+                id,
+                runtime.terrain_revision,
+                runtime.pending_light_edits.clone(),
+            )
         };
-        let world = Arc::clone(
-            &self
-                .mesh_world
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
-        );
         self.mesh_workers.submit_edit(MeshJob::Edit {
             id,
             terrain_revision,
-            world,
-            position: request.position,
-            block: request.block,
-            topology_changed: request.topology_changed,
+            world: next_world,
+            edits,
         });
-        self.status.set(String::from("Updating terrain…"));
+        self.refresh_frame();
+        self.status
+            .set(String::from("Terrain changed · updating light…"));
     }
 
-    /// Rebuild every resident chunk touched by changed geometry or light.
-    fn rebuild_edited_chunks(
-        &self,
-        position: IVec3,
-        light_update: LightUpdate,
-        topology_changed: bool,
-    ) {
+    /// Rebuild the edited near chunks synchronously using the previous light
+    /// field. The background result replaces their lighting afterwards.
+    fn rebuild_immediate_edit_chunks(&self, world: &World, position: IVec3) {
         let mut affected = HashSet::new();
         insert_chunks_for_voxel_bounds(
             &mut affected,
@@ -646,6 +665,49 @@ impl BoxcraftApp {
             position.z - 1,
             position.z + 1,
         );
+        let resident = self.near_meshes.get();
+        let rebuilt: HashMap<(i32, i32), Arc<boxcraft_core::Mesh>> = affected
+            .into_iter()
+            .filter(|chunk| resident.contains_key(chunk))
+            .map(|chunk| (chunk, Arc::new(mesh_chunk(world, chunk.0, chunk.1))))
+            .collect();
+        if rebuilt.is_empty() {
+            return;
+        }
+        self.near_core_meshes.update(|meshes| {
+            let mut next = (**meshes).clone();
+            for (chunk, mesh) in &rebuilt {
+                next.insert(*chunk, Arc::clone(mesh));
+            }
+            *meshes = Arc::new(next);
+        });
+        for (chunk, mesh) in &rebuilt {
+            self.update_near_mesh_from_core(*chunk, mesh);
+        }
+        let rendered = self.near_meshes.get();
+        self.presented_near_meshes.update(|meshes| {
+            let mut next = (**meshes).clone();
+            for chunk in rebuilt.keys() {
+                if let Some(mesh) = rendered.get(chunk) {
+                    next.insert(*chunk, Arc::clone(mesh));
+                }
+            }
+            *meshes = Arc::new(next);
+        });
+    }
+
+    /// Rebuild every resident chunk touched by changed geometry or light.
+    fn rebuild_edited_chunks(&self, edits: &[LightEdit], light_update: LightUpdate) {
+        let mut affected = HashSet::new();
+        for edit in edits {
+            insert_chunks_for_voxel_bounds(
+                &mut affected,
+                edit.position.x - 1,
+                edit.position.x + 1,
+                edit.position.z - 1,
+                edit.position.z + 1,
+            );
+        }
         if let Some((min_x, max_x, min_z, max_z)) = light_update.horizontal_bounds() {
             // Smooth vertex light samples cells on both sides of a chunk edge.
             insert_chunks_for_voxel_bounds(
@@ -686,7 +748,7 @@ impl BoxcraftApp {
             .copied()
             .filter(|chunk| far_chunks.contains(chunk))
             .collect();
-        let far_dirty = if topology_changed {
+        let far_dirty = if edits.iter().any(|edit| edit.topology_changed) {
             // Opening or sealing space can change which connected cave
             // component is visible, so topology edits invalidate the LOD map.
             self.far_core_meshes.set(Arc::new(
@@ -1128,6 +1190,7 @@ impl BoxcraftApp {
                             false
                         } else {
                             runtime.edit_job_in_flight = None;
+                            runtime.pending_light_edits.clear();
                             true
                         }
                     };
@@ -1138,11 +1201,7 @@ impl BoxcraftApp {
                             .unwrap_or_else(|poisoned| poisoned.into_inner()) =
                             Arc::clone(&result.world);
                         self.with_game(|game| game.world = Arc::clone(&result.world));
-                        self.rebuild_edited_chunks(
-                            result.position,
-                            result.light_update,
-                            result.topology_changed,
-                        );
+                        self.rebuild_edited_chunks(&result.edits, result.light_update);
                         self.status.set(String::from("Terrain updated"));
                         changed = true;
                     }
@@ -1472,15 +1531,7 @@ impl BoxcraftApp {
                 .partial_cmp(&mesh_distance_sq(right.bounds, camera.position))
                 .unwrap_or(core::cmp::Ordering::Equal)
         });
-        let mut terrain_vertices: usize = 0;
         for mesh in candidates {
-            let vertices = mesh.triangle_count().saturating_mul(3);
-            if vertices > MAX_TERRAIN_FRAME_VERTICES
-                || terrain_vertices.saturating_add(vertices) > MAX_TERRAIN_FRAME_VERTICES
-            {
-                continue;
-            }
-            terrain_vertices = terrain_vertices.saturating_add(vertices);
             let tint = if mesh.has_block_light {
                 Color::WHITE
             } else {
@@ -1788,7 +1839,7 @@ fn build_boxcraft_content(app: &BoxcraftApp) -> Box<dyn View> {
 /// a process-local sequence and an address-derived value. The latter keeps the
 /// fallback useful on guests without an initialized RTC as well.
 fn random_world_seed() -> u64 {
-    let os_entropy = scarlet_random_u64();
+    let os_entropy = platform_entropy_u64();
     let clock = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos() as u64)
@@ -1807,7 +1858,7 @@ fn random_world_seed() -> u64 {
 }
 
 #[cfg(target_os = "scarlet")]
-fn scarlet_random_u64() -> u64 {
+fn platform_entropy_u64() -> u64 {
     let mut bytes = [0_u8; 8];
     let result = syscall3(
         Syscall::GetRandom,
@@ -1823,7 +1874,7 @@ fn scarlet_random_u64() -> u64 {
 }
 
 #[cfg(not(target_os = "scarlet"))]
-fn scarlet_random_u64() -> u64 {
+fn platform_entropy_u64() -> u64 {
     0
 }
 

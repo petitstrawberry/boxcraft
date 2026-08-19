@@ -1,11 +1,9 @@
 # Boxcraft
 
-Boxcraft is a small first-person voxel sandbox for Scarlet OS. It is written in
+Boxcraft is a small cross-platform first-person voxel sandbox. It is written in
 Rust and uses ScarletUI for all window chrome and HUD rendering, with an SGFX
-canvas for the depth-tested world.
-
-Boxcraft is Scarlet-only: host builds intentionally retain a small command-line
-stub instead of a desktop frontend.
+canvas for the depth-tested world. Scarlet OS uses the native SWS/VirGL path;
+desktop builds use Winit and SGFX/WGPU.
 
 ## Workspace layout
 
@@ -14,7 +12,7 @@ The workspace follows the same split used by Vellum:
 - `boxcraft-core` is the dependency-free game domain: deterministic terrain,
   visible-face meshing, raycasts, player physics, and camera matrices.
 - `boxcraft` is the ScarletUI application crate. It translates the core mesh
-  into a textured SGFX triangle list and owns window/input integration.
+  into a textured SGFX triangle list and owns portable window/input integration.
 
 ## Terrain rendering
 
@@ -46,11 +44,17 @@ Or enter it directly:
 nix develop
 ```
 
-The host-safe checks exercise the pure core and the host stub:
+Run the tests and check the native frontend:
 
 ```bash
 cargo test -p boxcraft-core
 cargo check -p boxcraft
+```
+
+On macOS, launch the native Metal-backed WGPU frontend with:
+
+```bash
+cargo run -p boxcraft
 ```
 
 Build the Scarlet application for either supported userspace target:
@@ -102,10 +106,10 @@ or launcher integration.
 
 Boxcraft requires a ScarletUI revision with the SGFX depth-tested canvas,
 stable dynamic mesh handles and revisions, retained RGBA8 textures with
-per-vertex texture coordinates, SWS pointer lock, relative pointer motion, and
-mouse-button view modifiers. Terrain edits publish a new revision of one stable
-mesh handle; normal frames reuse that mesh and only update the camera transform,
-with a lightweight lighting revision as the day cycle advances.
+per-vertex texture coordinates, platform pointer lock, relative pointer motion,
+and mouse-button view modifiers. Terrain edits publish a new revision of one
+stable mesh handle; normal frames reuse that mesh and only update the camera
+transform, with a lightweight lighting revision as the day cycle advances.
 
 ## License
 

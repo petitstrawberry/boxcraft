@@ -4,13 +4,17 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
-use boxcraft_core::{
-    Block, IVec3, LightUpdate, Mesh, VisibleSpace, World, mesh_chunk, mesh_chunk_lod,
-};
+use boxcraft_core::{IVec3, LightUpdate, Mesh, VisibleSpace, World, mesh_chunk, mesh_chunk_lod};
 
 /// Two workers leave the UI and SGFX submission path on their own thread while
 /// still providing useful parallelism to a Scarlet guest launched with SMP.
 pub const WORKER_COUNT: usize = 2;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LightEdit {
+    pub position: IVec3,
+    pub topology_changed: bool,
+}
 
 pub enum MeshJob {
     Near {
@@ -33,9 +37,7 @@ pub enum MeshJob {
         id: u64,
         terrain_revision: u64,
         world: Arc<World>,
-        position: IVec3,
-        block: Block,
-        topology_changed: bool,
+        edits: Vec<LightEdit>,
     },
 }
 
@@ -59,9 +61,8 @@ pub struct EditMeshResult {
     pub id: u64,
     pub terrain_revision: u64,
     pub world: Arc<World>,
-    pub position: IVec3,
+    pub edits: Vec<LightEdit>,
     pub light_update: LightUpdate,
-    pub topology_changed: bool,
 }
 
 pub enum MeshResult {
@@ -106,16 +107,16 @@ impl MeshWorkers {
         self.shared.wake_workers.notify_one();
     }
 
-    /// Put an edit ahead of queued streaming work and discard queued jobs for
-    /// the old world snapshot. Jobs already executing are harmless: their
-    /// revision is rejected when the UI thread receives their result.
+    /// Put the newest light snapshot ahead of queued streaming work and
+    /// discard every queued job for older world revisions. Jobs already
+    /// executing are harmless: the UI rejects their stale revision.
     pub fn submit_edit(&self, job: MeshJob) {
         let mut jobs = self
             .shared
             .jobs
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        jobs.retain(|queued| matches!(queued, MeshJob::Edit { .. }));
+        jobs.clear();
         jobs.push_front(job);
         drop(jobs);
         self.shared
@@ -160,11 +161,15 @@ fn worker_loop(shared: Arc<Shared>) {
             jobs.pop_front().expect("mesh worker woke without a job")
         };
         let result = run_job(job);
-        shared
+        let mut results = shared
             .results
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push_back(result);
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if matches!(&result, MeshResult::Edit(_)) {
+            results.push_front(result);
+        } else {
+            results.push_back(result);
+        }
     }
 }
 
@@ -213,20 +218,17 @@ fn run_job(job: MeshJob) -> MeshResult {
             id,
             terrain_revision,
             world,
-            position,
-            block,
-            topology_changed,
+            edits,
         } => {
             let mut next_world = (*world).clone();
-            let _ = next_world.set(position, block);
-            let light_update = next_world.recompute_light_after_edit(position);
+            let positions = edits.iter().map(|edit| edit.position).collect::<Vec<_>>();
+            let light_update = next_world.recompute_light_after_edits(&positions);
             MeshResult::Edit(EditMeshResult {
                 id,
                 terrain_revision,
                 world: Arc::new(next_world),
-                position,
+                edits,
                 light_update,
-                topology_changed,
             })
         }
     }
@@ -235,6 +237,8 @@ fn run_job(job: MeshJob) -> MeshResult {
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, Instant};
+
+    use boxcraft_core::Block;
 
     use super::*;
 
@@ -295,19 +299,22 @@ mod tests {
     }
 
     #[test]
-    fn worker_applies_edit_and_recomputes_light_off_thread() {
+    fn worker_recomputes_batched_edit_light_off_thread() {
         let workers = MeshWorkers::new();
         let mut world = World::new(8, 8, 8);
         let position = IVec3::new(3, 3, 3);
         world.set(position, Block::Stone);
         world.recompute_light();
+        world.set(position, Block::Air);
+        let edit = LightEdit {
+            position,
+            topology_changed: true,
+        };
         workers.submit_edit(MeshJob::Edit {
             id: 61,
             terrain_revision: 14,
             world: Arc::new(world),
-            position,
-            block: Block::Air,
-            topology_changed: true,
+            edits: vec![edit],
         });
 
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -315,9 +322,8 @@ mod tests {
             if let Some(MeshResult::Edit(result)) = workers.try_recv() {
                 assert_eq!(result.id, 61);
                 assert_eq!(result.terrain_revision, 14);
-                assert_eq!(result.position, position);
+                assert_eq!(result.edits, vec![edit]);
                 assert_eq!(result.world.block(position), Some(Block::Air));
-                assert!(result.topology_changed);
                 assert!(result.light_update.horizontal_bounds().is_some());
                 break;
             }

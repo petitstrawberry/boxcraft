@@ -1,73 +1,110 @@
 # Boxcraft
 
-Boxcraft is a small cross-platform first-person voxel sandbox. It is written in
-Rust and uses ScarletUI for all window chrome and HUD rendering, with an SGFX
-canvas for the depth-tested world. Scarlet OS uses the native SWS/VirGL path;
-desktop builds use Winit and SGFX/WGPU.
+Boxcraft is a cross-platform first-person voxel sandbox written in Rust. Explore
+procedurally generated terrain, reshape it block by block, and watch the world
+move through a full day and night. Boxcraft runs as a native desktop application
+and can also be built for Scarlet OS.
 
-## Workspace layout
+## Highlights
 
-The workspace follows the same split used by Vellum:
+- Procedural worlds with oceans, beaches, plains, forests, deserts, mountains,
+  snow-covered peaks, caves, and trees
+- First-person movement, collision, jumping, block breaking, and block placement
+- Sunlight, ambient occlusion, torch light, and a 20-minute day/night cycle
+- Chunk streaming, background meshing, far-terrain level of detail, and an
+  adjustable render distance
+- A generated pixel-art texture atlas with no external game assets
 
-- `boxcraft-core` is the dependency-free game domain: deterministic terrain,
-  visible-face meshing, raycasts, player physics, and camera matrices.
-- `boxcraft` is the ScarletUI application crate. It translates the core mesh
-  into a textured SGFX triangle list and owns portable window/input integration.
+## Run on desktop
 
-## Terrain rendering
-
-The frontend builds one small procedural RGBA8 pixel-art atlas at startup. Core
-mesh vertices provide a material, normalized atlas UV, sky-light, and
-ambient-occlusion value; the frontend uses that metadata to sample the grass,
-dirt, stone, wood, leaves, sand, and water tiles. A slowly moving directional
-sun is combined with the baked occlusion and sky ambient light before each
-retained mesh update, so the same textured terrain shifts naturally from sunrise
-through night without changing the camera, depth-tested frame, or input path.
-
-External framework dependencies are Git dependencies. In particular, ScarletUI
-is fetched from `https://github.com/petitstrawberry/scarlet-ui`; the manifest
-intentionally has no local ScarletUI path or `[patch]` override. The local
-`boxcraft-core` workspace dependency remains a path dependency by design.
-
-## Development environment
-
-The included flake supplies the Scarlet Rust toolchain, `cargo-scarlet`, and
-the image tooling. With Nix and direnv installed:
+You need Git, a recent Rust toolchain, and a graphics adapter supported by WGPU.
+Clone the repository and run the desktop frontend:
 
 ```bash
-direnv allow
+git clone https://github.com/petitstrawberry/boxcraft.git
+cd boxcraft
+cargo run --release -p boxcraft
 ```
 
-Or enter it directly:
+The release profile is recommended because world generation and meshing are
+CPU-intensive. Desktop builds use Winit for window and input integration and
+WGPU for rendering; on macOS, WGPU uses Metal.
+
+The first build fetches ScarletUI and SGFX from their Git repositories.
+
+## Controls
+
+| Action | Input |
+| --- | --- |
+| Capture the pointer | Click the terrain or select **Capture pointer** |
+| Look around | Move the mouse while the pointer is captured |
+| Move | `W`, `A`, `S`, `D` |
+| Jump | `Space` |
+| Break a block | Left click |
+| Place the selected block | Right click |
+| Select a block | `1`–`9` |
+| Release the pointer / close settings | `Esc` |
+| Open or close settings | `O` |
+| Decrease or increase render distance | `-` / `+` |
+| Generate a new world | `R` |
+| Toggle fullscreen | `F11` |
+
+The numbered slots contain Grass, Dirt, Stone, Wood, Leaves, Sand, Snow, Air,
+and Torch in that order. Air occupies slot `8` for inspection but cannot be
+placed.
+
+## Architecture
+
+The workspace separates the game domain from platform integration:
+
+- `boxcraft-core` is dependency-free and contains deterministic world
+  generation, lighting, meshing, raycasts, player physics, and camera math.
+- `boxcraft` provides the ScarletUI/SGFX frontend, input handling, texture
+  generation, chunk streaming, and background mesh workers.
+
+The frontend selects its platform backend at compile time:
+
+| Target | Window and input | World rendering |
+| --- | --- | --- |
+| Desktop | ScarletUI with Winit | SGFX with WGPU |
+| Scarlet OS | ScarletUI with SWS | SGFX with VirGL |
+
+## Development
+
+Run the formatter, tests, and workspace check with Cargo:
+
+```bash
+cargo fmt --all -- --check
+cargo test --workspace
+cargo check --workspace
+```
+
+For a reproducible environment, the included Nix flake supplies the Rust
+toolchain and the additional Scarlet SDK tools:
 
 ```bash
 nix develop
 ```
 
-Run the tests and check the native frontend:
+If you use direnv, entering the repository can activate the same environment
+automatically after one approval:
 
 ```bash
-cargo test -p boxcraft-core
-cargo check -p boxcraft
+direnv allow
 ```
 
-On macOS, launch the native Metal-backed WGPU frontend with:
+## Build for Scarlet OS
+
+Enter the Nix development shell, then build either supported Scarlet userspace
+target:
 
 ```bash
-cargo run -p boxcraft
+cargo build --release -p boxcraft --target riscv64gc-unknown-scarlet
+cargo build --release -p boxcraft --target aarch64-unknown-scarlet
 ```
 
-Build the Scarlet application for either supported userspace target:
-
-```bash
-cargo build -p boxcraft --target riscv64gc-unknown-scarlet
-cargo build -p boxcraft --target aarch64-unknown-scarlet
-```
-
-## Add Boxcraft to a Scarlet image
-
-Scarlet images are composed from cargo layers. Add the following layer to the
-desktop bundle (or another image layer list) in your Scarlet checkout:
+To include Boxcraft in a Scarlet image, add a Cargo layer to the desired image
+definition in a Scarlet checkout:
 
 ```toml
 [[layers]]
@@ -78,7 +115,7 @@ bin = "boxcraft"
 to = "/system/scarlet/bin/boxcraft"
 ```
 
-Then build or run one of Scarlet's existing projects with the SDK commands:
+Build or run an existing Scarlet project with the SDK commands:
 
 ```bash
 cargo scarlet image --project projects/riscv64-limine-full
@@ -91,26 +128,6 @@ cargo scarlet run --project projects/aarch64-limine-full --release
 After the desktop starts, launch `/system/scarlet/bin/boxcraft` from a terminal
 or launcher integration.
 
-## Controls
-
-- Click the terrain or use **Capture pointer** to capture the pointer; `Esc`
-  releases it.
-- `W`, `A`, `S`, `D` move; `Space` jumps; relative mouse movement looks.
-- While captured, left click breaks a block and right click places the selected
-  block.
-- `1`–`6` select Grass, Dirt, Stone, Wood, Leaves, or Sand. `7` selects Air
-  (useful for inspecting the empty slot, but it cannot be placed).
-- `R` regenerates and resets the world; `F11` toggles fullscreen.
-
-## ScarletUI requirements
-
-Boxcraft requires a ScarletUI revision with the SGFX depth-tested canvas,
-stable dynamic mesh handles and revisions, retained RGBA8 textures with
-per-vertex texture coordinates, platform pointer lock, relative pointer motion,
-and mouse-button view modifiers. Terrain edits publish a new revision of one
-stable mesh handle; normal frames reuse that mesh and only update the camera
-transform, with a lightweight lighting revision as the day cycle advances.
-
 ## License
 
-Boxcraft is licensed under the MIT License.
+Boxcraft is licensed under the [MIT License](LICENSE).

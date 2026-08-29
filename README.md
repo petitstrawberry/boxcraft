@@ -67,7 +67,7 @@ The frontend selects its platform backend at compile time:
 | Target | Window and input | World rendering |
 | --- | --- | --- |
 | Desktop | ScarletUI with Winit | SGFX with WGPU |
-| Scarlet OS | ScarletUI with SWS | SGFX with VirGL |
+| Scarlet OS | ScarletUI with SWS | SGFX with the runtime-selected VirGL or Adreno A6xx backend |
 
 ## Development
 
@@ -127,6 +127,10 @@ cargo scarlet run --project projects/aarch64-limine-full --release
 
 After the desktop starts, launch `/system/scarlet/bin/boxcraft` from a terminal
 or launcher integration.
+
+The CoachZ/SC7180 image build also rebuilds a sibling Boxcraft checkout against
+the same in-tree Adreno backend used by SWS. This keeps its SGFX command stream
+and the kernel validator in lockstep while the hardware driver is developed.
 
 ## License
 

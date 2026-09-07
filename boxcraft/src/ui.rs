@@ -1860,12 +1860,15 @@ fn random_world_seed() -> u64 {
 #[cfg(target_os = "scarlet")]
 fn platform_entropy_u64() -> u64 {
     let mut bytes = [0_u8; 8];
-    let result = syscall3(
-        Syscall::GetRandom,
-        bytes.as_mut_ptr() as usize,
-        bytes.len(),
-        0,
-    );
+    // SAFETY: bytes remains exclusively borrowed and writable throughout the call.
+    let result = unsafe {
+        syscall3(
+            Syscall::GetRandom,
+            bytes.as_mut_ptr() as usize,
+            bytes.len(),
+            0,
+        )
+    };
     if result == bytes.len() {
         u64::from_le_bytes(bytes)
     } else {

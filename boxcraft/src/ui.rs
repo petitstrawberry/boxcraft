@@ -1,7 +1,9 @@
 //! Cross-platform ScarletUI frontend for Boxcraft.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+#[cfg(target_has_atomic = "64")]
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -55,7 +57,10 @@ const NEAR_CHUNK_RADIUS: i32 = 2;
 const FAR_MESH_GROUP_SIZE: i32 = 4;
 const MAX_FAR_GROUPS_PER_JOB: usize = 4;
 
+#[cfg(target_has_atomic = "64")]
 static NEXT_WORLD_SEED: AtomicU64 = AtomicU64::new(0xB0CA_FE00_2026_0001);
+#[cfg(not(target_has_atomic = "64"))]
+static NEXT_WORLD_SEED: Mutex<u64> = Mutex::new(0xB0CA_FE00_2026_0001);
 
 /// Run the Boxcraft application.
 ///
@@ -1844,7 +1849,17 @@ fn random_world_seed() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos() as u64)
         .unwrap_or(0);
+    #[cfg(target_has_atomic = "64")]
     let sequence = NEXT_WORLD_SEED.fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed);
+    #[cfg(not(target_has_atomic = "64"))]
+    let sequence = {
+        // The seed sequence keeps its 64-bit period; this lock is taken only
+        // when creating a world, outside the rendering and mesh-worker paths.
+        let mut next = NEXT_WORLD_SEED.lock().expect("world seed mutex poisoned");
+        let sequence = *next;
+        *next = sequence.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        sequence
+    };
     let address = (&clock as *const u64 as usize) as u64;
     let mut seed = os_entropy ^ clock ^ sequence.rotate_left(17) ^ address.rotate_right(11);
     seed = (seed ^ (seed >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);

@@ -32,6 +32,7 @@ const REFERENCE_ASPECT: f32 = 16.0 / 9.0;
 const CAMERA_FOV: f32 = 70.0_f32.to_radians();
 const REACH: f32 = 6.0;
 const LOOK_SENSITIVITY: f32 = 0.003;
+const GAMEPAD_LOOK_RADIANS_PER_SECOND: f32 = 2.5;
 const ATLAS_TILE_SIZE: u32 = 32;
 const ATLAS_COLUMNS: u32 = 4;
 const ATLAS_ROWS: u32 = 4;
@@ -89,6 +90,7 @@ impl PressedKeys {
             left: self.left,
             right: self.right,
             jump: self.jump,
+            ..PlayerInput::default()
         }
     }
 }
@@ -233,6 +235,8 @@ struct BoxcraftApp {
     pending_mouse_dx: Arc<AtomicI32>,
     pending_mouse_dy: Arc<AtomicI32>,
     mesh_workers: MeshWorkers,
+    gamepad: Arc<Mutex<crate::gamepad::Controls>>,
+    gamepad_navigation: State<Option<bool>>,
 }
 
 impl BoxcraftApp {
@@ -291,7 +295,9 @@ impl BoxcraftApp {
             selected_block: State::new(StateId::new(17), String::from("1: Grass")),
             status: State::new(
                 StateId::new(18),
-                String::from("Click the terrain to capture the pointer"),
+                String::from(
+                    "Gamepad: sticks move/look · B/South jump · ZR/ZL edit · L/R select · + settings",
+                ),
             ),
             canvas_handle: SgfxCanvasHandle::new(),
             chunk_handles: Arc::new(Mutex::new(HashMap::new())),
@@ -304,6 +310,8 @@ impl BoxcraftApp {
             pending_mouse_dx: Arc::new(AtomicI32::new(0)),
             pending_mouse_dy: Arc::new(AtomicI32::new(0)),
             mesh_workers: MeshWorkers::new(),
+            gamepad: Arc::new(Mutex::new(crate::gamepad::Controls::default())),
+            gamepad_navigation: State::new(StateId::new(29), None),
         };
         app.refresh_chunk_set();
         app.update_hud();
@@ -366,6 +374,8 @@ impl BoxcraftApp {
 
     fn toggle_settings(&self) {
         self.settings_visible.update(|visible| *visible = !*visible);
+        self.clear_pressed_keys();
+        self.clear_pending_mouse_delta();
     }
 
     fn reset_world(&self) {
@@ -571,6 +581,11 @@ impl BoxcraftApp {
             return true;
         }
 
+        self.edit_block(button);
+        true
+    }
+
+    fn edit_block(&self, button: MouseButton) {
         let request = self.with_game(|game| match button {
             MouseButton::Left => {
                 let hit = game.world.raycast(
@@ -597,7 +612,23 @@ impl BoxcraftApp {
         if let Some(request) = request {
             self.submit_edit(request);
         }
-        true
+    }
+
+    fn cycle_block(&self, delta: isize) {
+        const BLOCKS: [Block; 9] = [
+            Block::Grass,
+            Block::Dirt,
+            Block::Stone,
+            Block::Wood,
+            Block::Leaves,
+            Block::Sand,
+            Block::Snow,
+            Block::Air,
+            Block::Torch,
+        ];
+        let slot = self.with_game(|game| game.player.selected_slot);
+        let slot = (slot as isize + delta).rem_euclid(BLOCKS.len() as isize) as usize;
+        self.select_block(slot, BLOCKS[slot]);
     }
 
     /// Apply geometry immediately, then replace the pending background light
@@ -1673,7 +1704,43 @@ impl View for BoxcraftApp {
 }
 
 impl Application for BoxcraftApp {
+    fn on_gamepad(&mut self, _ctx: &WindowContext, event: GamepadEvent) {
+        let pressed = self
+            .gamepad
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .update(event);
+        let edge = |button| pressed & crate::gamepad::bit(button) != 0;
+        if edge(GamepadButton::Start) {
+            self.toggle_settings();
+            return;
+        }
+        if edge(GamepadButton::Select) {
+            self.toggle_fullscreen();
+        }
+        if self.settings_visible.get() {
+            return;
+        }
+        if edge(GamepadButton::LeftShoulder) {
+            self.cycle_block(-1);
+        }
+        if edge(GamepadButton::RightShoulder) {
+            self.cycle_block(1);
+        }
+        if edge(GamepadButton::RightTrigger) {
+            self.edit_block(MouseButton::Left);
+        }
+        if edge(GamepadButton::LeftTrigger) {
+            self.edit_block(MouseButton::Right);
+        }
+    }
+
     fn on_window_sync(&mut self, _ctx: &WindowContext, window: &mut dyn PlatformWindow) {
+        let navigation = self.settings_visible.get();
+        if self.gamepad_navigation.get() != Some(navigation) {
+            let _ = window.set_gamepad_input(true, navigation);
+            self.gamepad_navigation.set(Some(navigation));
+        }
         let desired_pointer_lock = self.pointer_lock_desired.get();
         if desired_pointer_lock != self.pointer_lock_applied.get()
             && !self.pointer_lock_pending.get()
@@ -1736,6 +1803,10 @@ impl Application for BoxcraftApp {
     fn on_focus_changed(&mut self, _window_id: u32, _app_name: &str, _menu_titles: &str) {
         self.clear_pressed_keys();
         self.clear_pending_mouse_delta();
+        self.gamepad
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 
     fn on_idle(&mut self) {
@@ -1759,14 +1830,30 @@ impl Application for BoxcraftApp {
             (delta_seconds, sun_phase)
         };
 
-        let input = self.keys.get().player_input();
+        let mut input = self.keys.get().player_input();
+        let look = if self.settings_visible.get() {
+            input = PlayerInput::default();
+            [0.0; 2]
+        } else {
+            let (pad, look) = self
+                .gamepad
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .sample();
+            input.strafe_axis = pad.strafe_axis;
+            input.forward_axis = pad.forward_axis;
+            input.jump |= pad.jump;
+            look
+        };
         let previous_camera = self.with_game(|game| game.player.camera());
         let (mouse_dx, mouse_dy) = self.take_pending_mouse_delta();
-        if mouse_dx != 0 || mouse_dy != 0 {
+        if mouse_dx != 0 || mouse_dy != 0 || look != [0.0; 2] {
             self.with_game(|game| {
                 game.player.look(
-                    mouse_dx as f32 * LOOK_SENSITIVITY,
-                    -(mouse_dy as f32) * LOOK_SENSITIVITY,
+                    mouse_dx as f32 * LOOK_SENSITIVITY
+                        + look[0] * GAMEPAD_LOOK_RADIANS_PER_SECOND * delta_seconds,
+                    -(mouse_dy as f32) * LOOK_SENSITIVITY
+                        - look[1] * GAMEPAD_LOOK_RADIANS_PER_SECOND * delta_seconds,
                 );
             });
         }

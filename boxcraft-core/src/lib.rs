@@ -2466,7 +2466,7 @@ impl Camera {
 }
 
 /// Frame input interpreted by [`Player::step`].
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct PlayerInput {
     /// Move in the facing direction on the horizontal plane.
     pub forward: bool,
@@ -2478,6 +2478,10 @@ pub struct PlayerInput {
     pub right: bool,
     /// Jump when standing on solid ground.
     pub jump: bool,
+    /// Analog strafe in -1..1; positive moves right. Added to digital input.
+    pub strafe_axis: f32,
+    /// Analog forward movement in -1..1; positive moves forward.
+    pub forward_axis: f32,
 }
 
 /// The simulation state of a single first-person player.
@@ -2567,7 +2571,15 @@ impl Player {
         let dt = delta_seconds.clamp(0.0, 0.1);
         let forward = Vec3::new(self.yaw.sin(), 0.0, -self.yaw.cos());
         let right = Vec3::new(-forward.z, 0.0, forward.x);
-        let mut move_direction = Vec3::zero();
+        let finite_axis = |value: f32| {
+            if value.is_finite() {
+                value.clamp(-1.0, 1.0)
+            } else {
+                0.0
+            }
+        };
+        let mut move_direction =
+            forward * finite_axis(input.forward_axis) + right * finite_axis(input.strafe_axis);
         if input.forward {
             move_direction += forward;
         }
@@ -2580,7 +2592,10 @@ impl Player {
         if input.right {
             move_direction += right;
         }
-        move_direction = move_direction.normalized() * 4.5;
+        if move_direction.length() > 1.0 {
+            move_direction = move_direction.normalized();
+        }
+        move_direction = move_direction * 4.5;
         self.velocity.x = move_direction.x;
         self.velocity.z = move_direction.z;
         if input.jump && self.grounded {
@@ -3739,6 +3754,49 @@ mod tests {
         world.set(IVec3::new(1, 2, 0), Block::Stone);
         let player = Player::new(Vec3::new(1.5, 1.0, 1.5));
         assert_eq!(player.place_block(&mut world, 5.0), None);
+    }
+
+    #[test]
+    fn player_analog_speed_is_proportional_and_mixed_input_stays_bounded() {
+        let world = World::new(16, 16, 16);
+        let start = Vec3::new(8.0, 8.0, 8.0);
+        let mut half = Player::new(start);
+        half.step(
+            &world,
+            PlayerInput {
+                forward_axis: 0.5,
+                ..PlayerInput::default()
+            },
+            0.1,
+        );
+        assert!((half.position.z - (start.z - 0.225)).abs() < 0.0001);
+
+        let mut diagonal = Player::new(start);
+        diagonal.step(
+            &world,
+            PlayerInput {
+                forward: true,
+                right: true,
+                forward_axis: 1.0,
+                strafe_axis: 1.0,
+                ..PlayerInput::default()
+            },
+            0.1,
+        );
+        let horizontal = Vec3::new(diagonal.velocity.x, 0.0, diagonal.velocity.z).length();
+        assert!((horizontal - 4.5).abs() < 0.0001);
+
+        let mut invalid = Player::new(start);
+        invalid.step(
+            &world,
+            PlayerInput {
+                forward_axis: f32::NAN,
+                strafe_axis: f32::INFINITY,
+                ..PlayerInput::default()
+            },
+            0.1,
+        );
+        assert_eq!((invalid.position.x, invalid.position.z), (start.x, start.z));
     }
 
     #[test]

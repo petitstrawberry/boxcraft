@@ -1,5 +1,6 @@
 //! Boxcraft application entry point.
 
+mod gamepad;
 mod mesh_worker;
 
 mod ui;

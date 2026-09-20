@@ -49,6 +49,22 @@ The first build fetches ScarletUI and SGFX from their Git repositories.
 | Generate a new world | `R` |
 | Toggle fullscreen | `F11` |
 
+Scarlet's native gamepad input also works without capturing the pointer:
+
+| Action | Gamepad / Joy-Con pair |
+| --- | --- |
+| Move at variable speed | Left stick |
+| Look around | Right stick |
+| Jump | South button (`B` on Joy-Con) |
+| Break / place a block | Right / left trigger (`ZR` / `ZL`) |
+| Previous / next block | Left / right shoulder (`L` / `R`) |
+| Open / close settings | Start (`+`) |
+| Toggle fullscreen | Select (`−`) |
+
+Sticks have a radial dead zone. Losing focus or disconnecting a controller
+releases its input. While settings are open, game movement stops and gamepad
+menu navigation is enabled. Desktop Winit gamepad delivery is not implemented.
+
 The numbered slots contain Grass, Dirt, Stone, Wood, Leaves, Sand, Snow, Air,
 and Torch in that order. Air occupies slot `8` for inspection but cannot be
 placed.
@@ -67,7 +83,7 @@ The frontend selects its platform backend at compile time:
 | Target | Window and input | World rendering |
 | --- | --- | --- |
 | Desktop | ScarletUI with Winit | SGFX with WGPU |
-| Scarlet OS | ScarletUI with SWS | SGFX with the runtime-selected VirGL or Adreno A6xx backend |
+| Scarlet OS | ScarletUI with SWS | SGFX with the runtime-selected VirGL, Adreno A6xx, or Maxwell backend |
 
 ## Development
 

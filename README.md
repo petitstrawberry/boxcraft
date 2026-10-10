@@ -109,6 +109,80 @@ automatically after one approval:
 direnv allow
 ```
 
+## Performance comparisons
+
+Run the repeatable CPU workloads with fixed seeds:
+
+```bash
+cargo run --release -p boxcraft-core --example performance
+cargo test -p boxcraft performance_idle_work -- --ignored --nocapture
+```
+
+On an Apple M3 Pro, the median across seeds 7, 11 and 42 changed from
+839 ms to 595 ms for world generation and from 138 ms to 56 ms for the
+96 far chunks at render distance 5. These are CPU timings, not QEMU results or
+GPU/FPS measurements. The full voxel/light data and every vertex/index in the
+render-distance-5 meshes matched the baseline for all three seeds.
+
+A second optimization pass reduced generation from 548 ms to 265 ms and near
+meshing from 5.28 ms to 4.56 ms relative to the first optimized version (medians
+of three runs each for seeds 7, 11 and 42 on the same Mac). Bulk writes resolve
+copy-on-write once per storage page, cave generation reuses noise lattice
+layers, and each face shares its lighting samples across four corners.
+Terrain, propagated light and the complete near/far meshes remained
+bit-identical. These timings measure CPU work independently of the 120 Hz
+display limit; they do not establish an FPS improvement on Scarlet.
+
+The rendering pass now culls mesh bounds against the six clip planes extracted
+from the actual projection, including the laid-out canvas aspect ratio. Across
+216 views (seeds 7/11/42, 24 yaw angles and three pitches at render distance 5),
+this reduces submitted triangles from 18,634,786 to 14,472,854 (22.3%) and mesh
+draws from 4,720 to 3,472 (26.4%) compared with the previous conservative test.
+These are submission counts, not measured GPU time or FPS. Reproduce them with
+`cargo test -p boxcraft performance_draw_workload -- --ignored --nocapture`.
+
+Build a committed baseline and the current working tree with identical release
+flags (requires Python 3):
+
+```bash
+scripts/build-performance-comparison.sh a341f37
+```
+
+The default command builds binaries for the current host. On Apple Silicon
+macOS, run them with:
+
+```bash
+./target/performance-comparison/aarch64-apple-darwin/before-boxcraft --seed 7
+./target/performance-comparison/aarch64-apple-darwin/after-boxcraft --seed 7
+```
+
+The binaries, Cargo build logs and build metadata are saved under
+`target/performance-comparison/<target>/`, so builds for different platforms
+stay separate. Scarlet RISC-V binaries are placed in
+`target/performance-comparison/riscv64gc-unknown-scarlet/`; run those inside
+Scarlet under QEMU. macOS cannot execute them directly.
+The baseline receives only the same seed
+override as the current game; its terrain, lighting and renderer stay intact.
+Run both with `--seed 7` (or `BOXCRAFT_SEED=7`) and the same render distance,
+window size, movement route and edit sequence. Reset also reuses this seed.
+For QEMU, keep its CPU count, memory, GPU backend and image identical between
+runs; record startup/loading time, movement FPS and edit stalls separately.
+
+For Scarlet's dynamic SGFX backend, pass your SDK's linker flags after `--`.
+For example, with a matching VirGL plugin already built:
+
+```bash
+scripts/build-performance-comparison.sh a341f37 --target riscv64gc-unknown-scarlet -- \
+  -C link-arg=--as-needed \
+  -C link-arg="$PWD/target/riscv64gc-unknown-scarlet/release/libsgfx_scarlet_virgl.so" \
+  -C link-arg=--unresolved-symbols=ignore-all
+```
+
+The shared input follows SGFX's dynamic-backend build procedure: it lets LLD
+emit imports provided by `/bin/scarlet-ld`. Audit the resulting ELF: only
+`dlopen`, `dlsym` and `dlerror` may remain undefined, with no `DT_NEEDED` backend
+dependency. The comparison script only builds binaries; it does not start QEMU.
+
 ## Build for Scarlet OS
 
 Enter the Nix development shell, then build either supported Scarlet userspace

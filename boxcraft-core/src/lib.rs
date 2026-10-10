@@ -472,6 +472,14 @@ impl<T: Clone> PagedVec<T> {
             .iter_mut()
             .flat_map(|page| Arc::make_mut(page).iter_mut())
     }
+
+    /// Resolve copy-on-write once per page for bulk, nonsequential writes.
+    fn mutable_pages(&mut self) -> Vec<&mut [T]> {
+        self.pages
+            .iter_mut()
+            .map(|page| Arc::make_mut(page).as_mut_slice())
+            .collect()
+    }
 }
 
 impl<T> PagedVec<T> {
@@ -859,10 +867,18 @@ impl World {
     /// A generated world whose terrain is entirely determined by the inputs.
     pub fn generate_sized(seed: u64, width: usize, height: usize, depth: usize) -> Self {
         let mut world = Self::new(width, height, depth);
+        let mut block_pages = world.blocks.mutable_pages();
         for z in 0..world.depth as i32 {
             for x in 0..world.width as i32 {
                 let column = terrain_column(seed, x, z);
-                world.fill_column(seed, x, z, &column);
+                world.skyline[z as usize * width + x as usize] = Self::fill_column(
+                    (width, height, depth),
+                    &mut block_pages,
+                    seed,
+                    x,
+                    z,
+                    &column,
+                );
             }
         }
         world.populate_trees(seed);
@@ -957,23 +973,56 @@ impl World {
         self.direct_sunlight.iter_mut().for_each(|light| *light = 0);
         self.sunlight.iter_mut().for_each(|light| *light = 0);
         let mut queue = std::collections::VecDeque::new();
+        // Full-strength vertical sky is already at its final value. Only its
+        // border with attenuated columns can contribute to flood propagation.
+        let mut sky_floor = vec![self.height as i32; self.width * self.depth];
+        let mut direct_pages = self.direct_sunlight.mutable_pages();
+        let mut light_pages = self.sunlight.mutable_pages();
         for z in 0..self.depth as i32 {
             for x in 0..self.width as i32 {
                 let mut level = 15_u8;
                 for y in (0..self.height as i32).rev() {
-                    let position = IVec3::new(x, y, z);
-                    let opacity = self.block(position).unwrap_or(Block::Air).light_opacity();
+                    let index = (y as usize * self.depth + z as usize) * self.width + x as usize;
+                    let opacity = self.blocks[index].light_opacity();
                     if opacity > 0 || level < 15 {
                         level = level.saturating_sub(opacity.max(1));
                     }
                     if level == 0 {
                         break;
                     }
-                    if let Some(index) = self.index(position) {
-                        self.direct_sunlight[index] = level;
-                        self.sunlight[index] = level;
+                    let page = index / STORAGE_PAGE_SIZE;
+                    let offset = index % STORAGE_PAGE_SIZE;
+                    direct_pages[page][offset] = level;
+                    light_pages[page][offset] = level;
+                    if level == 15 {
+                        sky_floor[z as usize * self.width + x as usize] = y;
+                    } else {
                         queue.push_back(index);
                     }
+                }
+            }
+        }
+        for z in 0..self.depth {
+            for x in 0..self.width {
+                let column = z * self.width + x;
+                let floor = sky_floor[column];
+                let mut neighbor_floor = floor;
+                for (nx, nz) in [
+                    (x as i32 - 1, z as i32),
+                    (x as i32 + 1, z as i32),
+                    (x as i32, z as i32 - 1),
+                    (x as i32, z as i32 + 1),
+                ] {
+                    if nx >= 0 && nz >= 0 && nx < self.width as i32 && nz < self.depth as i32 {
+                        neighbor_floor =
+                            neighbor_floor.max(sky_floor[nz as usize * self.width + nx as usize]);
+                    }
+                }
+                // Include the bottom full-strength cell to light transparent
+                // material immediately below it (water and leaves included).
+                let end = neighbor_floor.max(floor + 1).min(self.height as i32);
+                for y in floor..end {
+                    queue.push_back((y as usize * self.depth + z) * self.width + x);
                 }
             }
         }
@@ -1065,8 +1114,17 @@ impl World {
         }
     }
 
-    fn fill_column(&mut self, seed: u64, x: i32, z: i32, column: &TerrainColumn) {
-        for y in 0..=column.height {
+    fn fill_column(
+        (width, height, depth): (usize, usize, usize),
+        block_pages: &mut [&mut [Block]],
+        seed: u64,
+        x: i32,
+        z: i32,
+        column: &TerrainColumn,
+    ) -> i32 {
+        let mut highest_opaque = -1;
+        let mut caves = CaveColumn::new(seed, x, z);
+        for y in 0..=column.height.min(height as i32 - 1) {
             let mut block = if y == column.height {
                 column.surface
             } else if y + 4 >= column.height {
@@ -1076,18 +1134,22 @@ impl World {
             };
             // Carve winding cave tunnels through the rock body, but keep a
             // sealed floor under the sea so oceans do not drain into caves.
-            if y >= 2
-                && y <= column.height
-                && column.height > SEA_LEVEL + 2
-                && is_cave(seed, x, y, z)
-            {
+            if y >= 2 && y <= column.height && column.height > SEA_LEVEL + 2 && caves.contains(y) {
                 block = Block::Air;
             }
-            self.set(IVec3::new(x, y, z), block);
+            // Generation owns empty columns; avoid updating the skyline and
+            // checking bounds once per voxel. Trees and later edits use set.
+            let index = (y as usize * depth + z as usize) * width + x as usize;
+            block_pages[index / STORAGE_PAGE_SIZE][index % STORAGE_PAGE_SIZE] = block;
+            if block.occludes() {
+                highest_opaque = y;
+            }
         }
-        for y in column.height + 1..=SEA_LEVEL.min(self.height as i32 - 1) {
-            self.set(IVec3::new(x, y, z), Block::Water);
+        for y in column.height + 1..=SEA_LEVEL.min(height as i32 - 1) {
+            let index = (y as usize * depth + z as usize) * width + x as usize;
+            block_pages[index / STORAGE_PAGE_SIZE][index % STORAGE_PAGE_SIZE] = Block::Water;
         }
+        highest_opaque
     }
 
     /// Incrementally refresh both light channels after one block edit.
@@ -1801,11 +1863,16 @@ fn mesh_region_greedy(
     }
 
     let mut mesh = Mesh::default();
+    let mut mesh_height = 0;
     for y in 0..world.height as i32 {
         for z in min_z..=max_z {
             for x in min_x..=max_x {
                 let position = IVec3::new(x, y, z);
-                if world.block(position) == Some(Block::Torch) {
+                let block = world.block(position).unwrap();
+                if block.is_renderable() {
+                    mesh_height = y + 1;
+                }
+                if block == Block::Torch {
                     append_torch_mesh(world, &mut mesh, position);
                 }
             }
@@ -1814,14 +1881,16 @@ fn mesh_region_greedy(
 
     for spec in GREEDY_FACE_SPECS {
         let (plane_min, plane_max, u_min, u_max, v_min, v_max) =
-            greedy_face_limits(spec, min_x, max_x, min_z, max_z, world.height as i32);
+            greedy_face_limits(spec, min_x, max_x, min_z, max_z, mesh_height);
         if plane_min > plane_max || u_min > u_max || v_min > v_max {
             continue;
         }
         let u_len = (u_max - u_min + 1) as usize;
         let v_len = (v_max - v_min + 1) as usize;
+        // Every plane overwrites the whole mask; reuse its storage instead of
+        // allocating one height-sized buffer per slice.
+        let mut mask = vec![None; u_len * v_len];
         for plane in plane_min..=plane_max {
-            let mut mask = vec![None; u_len * v_len];
             for v_index in 0..v_len {
                 for u_index in 0..u_len {
                     let position = greedy_face_position(
@@ -1962,30 +2031,20 @@ fn greedy_face_cell(
     let inset_surface = block == Block::Water
         && spec.normal.y > 0
         && neighbor_block.is_none_or(|neighbor| !neighbor.is_renderable());
-    let normal = Vec3::new(
-        spec.normal.x as f32,
-        spec.normal.y as f32,
-        spec.normal.z as f32,
-    );
     let corners = [
         spec.base,
         spec.base + spec.u,
         spec.base + spec.u + spec.v,
         spec.base + spec.v,
     ];
-    let lighting = corners.map(|corner| {
-        let corner = if inset_surface && corner.y >= 1.0 {
+    let corners = corners.map(|corner| {
+        if inset_surface && corner.y >= 1.0 {
             Vec3::new(corner.x, 0.875, corner.z)
         } else {
             corner
-        };
-        let light = vertex_light(world, position, normal, corner);
-        GreedyLighting {
-            ambient_occlusion: vertex_ambient_occlusion(world, position, normal, corner),
-            light: light[0],
-            torch_light: light[1],
         }
     });
+    let lighting = face_lighting(world, position, spec.normal, corners);
     Some(GreedyFaceCell {
         block,
         inset_surface,
@@ -2152,25 +2211,27 @@ fn mesh_region(
                         let surface_y = if inset_surface { 0.875 } else { 1.0 };
                         let first = mesh.vertices.len() as u32;
                         let offset = Vec3::new(x as f32, y as f32, z as f32);
-                        let normal = Vec3::new(normal.x as f32, normal.y as f32, normal.z as f32);
-                        for (corner, uv) in corners.into_iter().zip(FACE_UVS) {
-                            let corner = if corner.y >= 1.0 {
+                        let corners = corners.map(|corner| {
+                            if corner.y >= 1.0 {
                                 Vec3::new(corner.x, surface_y, corner.z)
                             } else {
                                 corner
-                            };
-                            let light = vertex_light(world, position, normal, corner);
+                            }
+                        });
+                        let lighting = face_lighting(world, position, normal, corners);
+                        let normal = Vec3::new(normal.x as f32, normal.y as f32, normal.z as f32);
+                        for ((corner, uv), lighting) in
+                            corners.into_iter().zip(FACE_UVS).zip(lighting)
+                        {
                             mesh.vertices.push(Vertex {
                                 position: offset + corner,
                                 normal,
                                 color: block.color(),
                                 block,
                                 atlas_uv: atlas_uv(block, normal, uv),
-                                ambient_occlusion: vertex_ambient_occlusion(
-                                    world, position, normal, corner,
-                                ),
-                                light: light[0],
-                                torch_light: light[1],
+                                ambient_occlusion: lighting.ambient_occlusion,
+                                light: lighting.light,
+                                torch_light: lighting.torch_light,
                             });
                         }
                         mesh.indices.extend_from_slice(&[
@@ -2323,6 +2384,70 @@ fn append_torch_mesh(world: &World, mesh: &mut Mesh, position: IVec3) {
     }
 }
 
+/// Share the nine cells outside a face between smooth lighting and AO for
+/// all four corners. Reading each corner separately needs 28 voxel lookups.
+fn face_lighting(
+    world: &World,
+    position: IVec3,
+    normal: IVec3,
+    corners: [Vec3; 4],
+) -> [GreedyLighting; 4] {
+    // Tangents follow XYZ order, matching the original sum order exactly.
+    let (first_axis, second_axis) = if normal.x != 0 {
+        (1, 2)
+    } else if normal.y != 0 {
+        (0, 2)
+    } else {
+        (0, 1)
+    };
+    let mut samples = [(0.0_f32, 0.0_f32, false); 9];
+    for first in 0..3 {
+        for second in 0..3 {
+            let mut offset = normal;
+            set_axis(&mut offset, first_axis, first as i32 - 1);
+            set_axis(&mut offset, second_axis, second as i32 - 1);
+            samples[first * 3 + second] = match world.index(position + offset) {
+                Some(index) if !world.blocks[index].is_solid() => (
+                    world.sunlight[index] as f32 / 15.0,
+                    world.block_light[index] as f32 / 15.0,
+                    false,
+                ),
+                Some(_) => (0.0, 0.0, true),
+                None => (1.0, 0.0, false),
+            };
+        }
+    }
+    corners.map(|corner| {
+        let components = [corner.x, corner.y, corner.z];
+        let first = usize::from(components[first_axis] >= 1.0);
+        let second = usize::from(components[second_axis] >= 1.0);
+        let start = first * 3 + second;
+        let mut light = 0.0;
+        let mut torch_light = 0.0;
+        for index in [start, start + 1, start + 3, start + 4] {
+            light += samples[index].0;
+            torch_light += samples[index].1;
+        }
+        // Inset water corners use a different threshold for AO than light.
+        let ao_first = if components[first_axis] < 0.5 { 0 } else { 2 };
+        let ao_second = if components[second_axis] < 0.5 { 0 } else { 2 };
+        let side_first = samples[ao_first * 3 + 1].2;
+        let side_second = samples[3 + ao_second].2;
+        let diagonal = samples[ao_first * 3 + ao_second].2;
+        let occluders = if side_first && side_second {
+            3
+        } else {
+            side_first as i32 + side_second as i32 + diagonal as i32
+        };
+        GreedyLighting {
+            ambient_occlusion: 1.0 - occluders as f32 * 0.18,
+            light: light / 4.0,
+            torch_light: torch_light / 4.0,
+        }
+    })
+}
+
+#[cfg(test)]
 fn vertex_ambient_occlusion(world: &World, position: IVec3, normal: Vec3, corner: Vec3) -> f32 {
     let normal = IVec3::new(normal.x as i32, normal.y as i32, normal.z as i32);
     let mut sides = [false; 2];
@@ -2404,15 +2529,14 @@ fn vertex_light(world: &World, position: IVec3, normal: Vec3, corner: Vec3) -> [
                 index += 1;
             }
             let cell = position + offset;
-            let sky = if world.block(cell).is_some_and(Block::is_solid) {
-                0.0
-            } else {
-                world.sunlight(cell) as f32 / 15.0
-            };
-            let torch = if world.block(cell).is_some_and(Block::is_solid) {
-                0.0
-            } else {
-                world.block_light(cell) as f32 / 15.0
+            // All three channels share the same coordinate and storage index.
+            let (sky, torch) = match world.index(cell) {
+                Some(index) if !world.blocks[index].is_solid() => (
+                    world.sunlight[index] as f32 / 15.0,
+                    world.block_light[index] as f32 / 15.0,
+                ),
+                Some(_) => (0.0, 0.0),
+                None => (1.0, 0.0),
             };
             sum += sky;
             torch_sum += torch;
@@ -2825,8 +2949,6 @@ enum Biome {
 
 fn terrain_column(seed: u64, x: i32, z: i32) -> TerrainColumn {
     let height = terrain_height(seed, x, z);
-    let temperature = fbm(seed ^ 0x1D3E_5A6B_7C8D_9E0F, x, z, 96, 3);
-    let moisture = fbm(seed ^ 0x2C4F_6E80_91A2_B3C4, x, z, 72, 3);
     let (biome, surface, subsurface) = if height <= SEA_LEVEL - 2 {
         (Biome::Ocean, Block::Sand, Block::Sand)
     } else if height <= SEA_LEVEL + 1 {
@@ -2835,15 +2957,22 @@ fn terrain_column(seed: u64, x: i32, z: i32) -> TerrainColumn {
         (Biome::SnowPeaks, Block::Snow, Block::Stone)
     } else if height >= SNOW_LINE - 6 {
         (Biome::Mountains, Block::Stone, Block::Stone)
-    } else if moisture < -0.32 && temperature > 0.05 {
-        (Biome::Desert, Block::Sand, Block::Sand)
     } else {
-        let forest = moisture > 0.12;
-        (
-            if forest { Biome::Forest } else { Biome::Plains },
-            Block::Grass,
-            Block::Dirt,
-        )
+        // Climate cannot change ocean, beach or mountain materials.
+        let moisture = fbm(seed ^ 0x2C4F_6E80_91A2_B3C4, x, z, 72, 3);
+        if moisture < -0.32 && fbm(seed ^ 0x1D3E_5A6B_7C8D_9E0F, x, z, 96, 3) > 0.05 {
+            (Biome::Desert, Block::Sand, Block::Sand)
+        } else {
+            (
+                if moisture > 0.12 {
+                    Biome::Forest
+                } else {
+                    Biome::Plains
+                },
+                Block::Grass,
+                Block::Dirt,
+            )
+        }
     };
     let forest_density = match biome {
         Biome::Forest => 0.62,
@@ -2880,10 +3009,17 @@ pub fn terrain_height(seed: u64, x: i32, z: i32) -> i32 {
     // the individual crests, while erosion cuts valleys back into them.
     let mountain_region = fbm_at(seed ^ 0x7B29_4D0F_91D7_05B3, wx, wz, 96, 3);
     let mountain_mask = smoothstep(((mountain_region - 0.15) / 0.45).clamp(0.0, 1.0));
-    let ridge = (1.0 - fbm_at(seed ^ 0x4CF5_AD43_2745_937F, wx, wz, 42, 4).abs()).powi(3);
-    let ridge_height = ridge * mountain_mask * 50.0;
-    let erosion = fbm_at(seed ^ 0xA54F_F53A_1B7E_9C21, wx, wz, 70, 3);
-    let valley_cut = ((-erosion - 0.24) / 0.76).clamp(0.0, 1.0) * mountain_mask * 8.0;
+    // These seven noise octaves contribute exactly zero outside mountain belts.
+    let (ridge_height, valley_cut) = if mountain_mask > 0.0 {
+        let ridge = (1.0 - fbm_at(seed ^ 0x4CF5_AD43_2745_937F, wx, wz, 42, 4).abs()).powi(3);
+        let erosion = fbm_at(seed ^ 0xA54F_F53A_1B7E_9C21, wx, wz, 70, 3);
+        (
+            ridge * mountain_mask * 50.0,
+            ((-erosion - 0.24) / 0.76).clamp(0.0, 1.0) * mountain_mask * 8.0,
+        )
+    } else {
+        (0.0, 0.0)
+    };
 
     // Narrow low-frequency noise bands form winding river valleys. Lowering
     // them through the water table lets the existing water fill logic create
@@ -2898,7 +3034,80 @@ pub fn terrain_height(seed: u64, x: i32, z: i32) -> i32 {
     elevation.round().clamp(1.0, TERRAIN_MAX_HEIGHT as f32) as i32
 }
 
-/// Returns whether a 3D noise sample opens a cave tunnel at this cell.
+/// Noise along a vertical column. The lattice corners and horizontal blends
+/// stay constant until y crosses a lattice boundary, so cache both layers.
+struct NoiseColumn {
+    seed: u64,
+    grid_x: i32,
+    grid_z: i32,
+    blend_x: f32,
+    blend_z: f32,
+    wavelength: i32,
+    cached_y: Option<i32>,
+    layers: [f32; 2],
+}
+
+impl NoiseColumn {
+    fn new(seed: u64, x: i32, z: i32, wavelength: i32) -> Self {
+        Self {
+            seed,
+            grid_x: x.div_euclid(wavelength),
+            grid_z: z.div_euclid(wavelength),
+            blend_x: smoothstep(x.rem_euclid(wavelength) as f32 / wavelength as f32),
+            blend_z: smoothstep(z.rem_euclid(wavelength) as f32 / wavelength as f32),
+            wavelength,
+            cached_y: None,
+            layers: [0.0; 2],
+        }
+    }
+
+    fn sample(&mut self, y: i32) -> f32 {
+        let grid_y = y.div_euclid(self.wavelength);
+        if self.cached_y != Some(grid_y) {
+            for dy in 0..2 {
+                let z = grid_y * 31 + dy * 7 + self.grid_z;
+                let north = lerp(
+                    hash_to_unit(self.seed, self.grid_x, z),
+                    hash_to_unit(self.seed, self.grid_x + 1, z),
+                    self.blend_x,
+                );
+                let south = lerp(
+                    hash_to_unit(self.seed, self.grid_x, z + 1),
+                    hash_to_unit(self.seed, self.grid_x + 1, z + 1),
+                    self.blend_x,
+                );
+                self.layers[dy as usize] = lerp(north, south, self.blend_z);
+            }
+            self.cached_y = Some(grid_y);
+        }
+        let blend_y = smoothstep(y.rem_euclid(self.wavelength) as f32 / self.wavelength as f32);
+        lerp(self.layers[0], self.layers[1], blend_y)
+    }
+}
+
+struct CaveColumn {
+    tunnel_a: NoiseColumn,
+    tunnel_b: NoiseColumn,
+    room: NoiseColumn,
+}
+
+impl CaveColumn {
+    fn new(seed: u64, x: i32, z: i32) -> Self {
+        Self {
+            tunnel_a: NoiseColumn::new(seed ^ 0x3A7B_2D4E_6F80_91A2, x, z, 28),
+            tunnel_b: NoiseColumn::new(seed ^ 0x5C9E_1F30_7153_B4D6, x, z, 28),
+            room: NoiseColumn::new(seed ^ 0x6E80_91A2_B3C4_D5E6, x, z, 20),
+        }
+    }
+
+    fn contains(&mut self, y: i32) -> bool {
+        self.tunnel_a.sample(y * 2).abs() < 0.10 && self.tunnel_b.sample(y * 2).abs() < 0.10
+            || self.room.sample(y) > 0.78
+    }
+}
+
+/// Reference cave sampler without column caching.
+#[cfg(test)]
 fn is_cave(seed: u64, x: i32, y: i32, z: i32) -> bool {
     // Two independent ridged fields intersected produce winding tunnels
     // rather than noisy blobs: a cave exists only where both are near zero.
@@ -2952,6 +3161,7 @@ fn value_noise_f(seed: u64, x: f32, z: f32, wavelength: i32) -> f32 {
     lerp(north, south, blend_z)
 }
 
+#[cfg(test)]
 fn value_noise_3d(seed: u64, x: i32, y: i32, z: i32, wavelength: i32) -> f32 {
     debug_assert!(wavelength > 0);
     let grid_x = x.div_euclid(wavelength);
@@ -3030,6 +3240,174 @@ mod tests {
         GREEDY_FACE_SPECS, IVec3, Mat4, Mesh, Player, PlayerInput, SEA_LEVEL, Vec3, VisibleSpace,
         World, mesh_chunk, mesh_chunk_lod, mesh_region_greedy, mesh_world, terrain_height,
     };
+
+    #[test]
+    fn cached_column_noise_matches_reference_across_lattice_boundaries() {
+        for seed in [0, 7, 11, 42, u64::MAX] {
+            for (x, z) in [(-29, -20), (0, 0), (19, 27), (28, 40), (383, 383)] {
+                for wavelength in [20, 28] {
+                    let mut column = super::NoiseColumn::new(seed, x, z, wavelength);
+                    // Reverse traversal also checks cache invalidation after a jump.
+                    for y in (-64..192).chain((-64..192).rev()) {
+                        assert_eq!(
+                            column.sample(y).to_bits(),
+                            super::value_noise_3d(seed, x, y, z, wavelength).to_bits()
+                        );
+                    }
+                }
+                let mut caves = super::CaveColumn::new(seed, x, z);
+                for y in -64..192 {
+                    assert_eq!(caves.contains(y), super::is_cave(seed, x, y, z));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shared_face_lighting_matches_per_vertex_sampling() {
+        let mut world = World::new(7, 6, 5);
+        let mut random = 42_u32;
+        for index in 0..world.blocks.len() {
+            random = random.wrapping_mul(1664525).wrapping_add(1013904223);
+            world.blocks[index] = [
+                Block::Air,
+                Block::Stone,
+                Block::Water,
+                Block::Leaves,
+                Block::Torch,
+            ][(random >> 16) as usize % 5];
+            world.sunlight[index] = (random >> 8) as u8 % 16;
+            world.block_light[index] = (random >> 24) as u8 % 16;
+        }
+        for y in 0..world.height as i32 {
+            for z in 0..world.depth as i32 {
+                for x in 0..world.width as i32 {
+                    let position = IVec3::new(x, y, z);
+                    for spec in GREEDY_FACE_SPECS {
+                        for inset in [false, true] {
+                            let corners = [
+                                spec.base,
+                                spec.base + spec.u,
+                                spec.base + spec.u + spec.v,
+                                spec.base + spec.v,
+                            ]
+                            .map(|mut corner| {
+                                if inset && corner.y >= 1.0 {
+                                    corner.y = 0.875;
+                                }
+                                corner
+                            });
+                            let normal = Vec3::new(
+                                spec.normal.x as f32,
+                                spec.normal.y as f32,
+                                spec.normal.z as f32,
+                            );
+                            let actual =
+                                super::face_lighting(&world, position, spec.normal, corners);
+                            for (corner, actual) in corners.into_iter().zip(actual) {
+                                let expected =
+                                    super::vertex_light(&world, position, normal, corner);
+                                let ao = super::vertex_ambient_occlusion(
+                                    &world, position, normal, corner,
+                                );
+                                assert_eq!(actual.light.to_bits(), expected[0].to_bits());
+                                assert_eq!(actual.torch_light.to_bits(), expected[1].to_bits());
+                                assert_eq!(actual.ambient_occlusion.to_bits(), ao.to_bits());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Reference solver that seeds every directly lit cell, including empty sky.
+    fn exhaustive_sunlight(world: &World) -> (Vec<u8>, Vec<u8>) {
+        let mut direct = vec![0; world.blocks.len()];
+        let mut light = direct.clone();
+        let mut queue = std::collections::VecDeque::new();
+        for z in 0..world.depth as i32 {
+            for x in 0..world.width as i32 {
+                let mut level = 15_u8;
+                for y in (0..world.height as i32).rev() {
+                    let position = IVec3::new(x, y, z);
+                    let opacity = world.block(position).unwrap().light_opacity();
+                    if opacity > 0 || level < 15 {
+                        level = level.saturating_sub(opacity.max(1));
+                    }
+                    if level == 0 {
+                        break;
+                    }
+                    let index = world.index(position).unwrap();
+                    direct[index] = level;
+                    light[index] = level;
+                    queue.push_back(position);
+                }
+            }
+        }
+        while let Some(position) = queue.pop_front() {
+            let level = light[world.index(position).unwrap()];
+            for offset in [
+                IVec3::new(-1, 0, 0),
+                IVec3::new(1, 0, 0),
+                IVec3::new(0, -1, 0),
+                IVec3::new(0, 1, 0),
+                IVec3::new(0, 0, -1),
+                IVec3::new(0, 0, 1),
+            ] {
+                let neighbor = position + offset;
+                let Some(index) = world.index(neighbor) else {
+                    continue;
+                };
+                let spread = level.saturating_sub(world.blocks[index].light_opacity().max(1));
+                if spread > light[index] {
+                    light[index] = spread;
+                    queue.push_back(neighbor);
+                }
+            }
+        }
+        (direct, light)
+    }
+
+    #[test]
+    fn sky_frontier_matches_exhaustive_propagation() {
+        for (width, height, depth) in [(0, 0, 0), (1, 17, 1), (13, 17, 11), (32, 24, 32)] {
+            for seed in 0..8 {
+                let mut world = World::new(width, height, depth);
+                for y in 0..height as i32 {
+                    for z in 0..depth as i32 {
+                        for x in 0..width as i32 {
+                            let material = super::hash(seed + y as u64 * 19, x, z) % 16;
+                            let block = match material {
+                                0..=2 => Block::Stone,
+                                3 => Block::Leaves,
+                                4 => Block::Water,
+                                5 => Block::Torch,
+                                _ => Block::Air,
+                            };
+                            world.set(IVec3::new(x, y, z), block);
+                        }
+                    }
+                }
+                let (direct, expected) = exhaustive_sunlight(&world);
+                world.recompute_light();
+                assert_eq!(
+                    world.direct_sunlight.iter().copied().collect::<Vec<_>>(),
+                    direct
+                );
+                assert_eq!(
+                    world.sunlight.iter().copied().collect::<Vec<_>>(),
+                    expected,
+                    "size={width}/{height}/{depth}, seed={seed}"
+                );
+            }
+        }
+        for seed in [7, 11, 42] {
+            let world = World::generate_sized(seed, 48, 32, 48);
+            let (_, expected) = exhaustive_sunlight(&world);
+            assert_eq!(world.sunlight.iter().copied().collect::<Vec<_>>(), expected);
+        }
+    }
 
     #[test]
     fn generation_is_deterministic() {

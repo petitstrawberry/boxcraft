@@ -107,6 +107,7 @@ struct Runtime {
     next_mesh_job_id: u64,
     terrain_revision: u64,
     player_chunk: (i32, i32),
+    stream_distance: Option<i32>,
     far_dirty: bool,
     far_chunks: Vec<(i32, i32)>,
     far_pending_chunks: Vec<(i32, i32)>,
@@ -131,6 +132,7 @@ impl Runtime {
             next_mesh_job_id: 0,
             terrain_revision: 0,
             player_chunk: (i32::MAX, i32::MAX),
+            stream_distance: None,
             far_dirty: false,
             far_chunks: Vec::new(),
             far_pending_chunks: Vec::new(),
@@ -211,6 +213,7 @@ struct BoxcraftApp {
     settings_visible: State<bool>,
     render_distance: State<i32>,
     canvas_frame: State<Arc<SgfxCanvasFrame>>,
+    canvas_aspect: State<f32>,
     near_core_meshes: State<Arc<HashMap<(i32, i32), Arc<boxcraft_core::Mesh>>>>,
     near_meshes: State<Arc<HashMap<(i32, i32), Arc<TerrainMesh>>>>,
     presented_near_meshes: State<Arc<HashMap<(i32, i32), Arc<TerrainMesh>>>>,
@@ -241,7 +244,10 @@ struct BoxcraftApp {
 
 impl BoxcraftApp {
     fn new() -> Self {
-        let seed = random_world_seed();
+        Self::with_seed(random_world_seed())
+    }
+
+    fn with_seed(seed: u64) -> Self {
         let initial_game = Game::generated(seed);
         let mesh_world = Arc::new(Mutex::new(Arc::clone(&initial_game.world)));
         let initial_frame = Arc::new(
@@ -263,6 +269,7 @@ impl BoxcraftApp {
             settings_visible: State::new(StateId::new(22), false),
             render_distance: State::new(StateId::new(23), DEFAULT_RENDER_DISTANCE),
             canvas_frame: State::new(StateId::new(10), initial_frame),
+            canvas_aspect: State::new(StateId::new(30), REFERENCE_ASPECT),
             near_core_meshes: State::new(
                 StateId::new(25),
                 Arc::new(HashMap::<(i32, i32), Arc<boxcraft_core::Mesh>>::new()),
@@ -844,6 +851,20 @@ impl BoxcraftApp {
         });
         let distance = self.render_distance.get();
         let near_radius = distance.min(NEAR_CHUNK_RADIUS);
+        let resident_near = self.near_meshes.get();
+        {
+            let runtime = self.runtime.lock().unwrap_or_else(|e| e.into_inner());
+            // Once resident, camera motion only changes the draw frustum. A
+            // new chunk, render distance or missing mesh still reconciles;
+            // pending far work still gets reprioritized on camera turns.
+            if runtime.player_chunk == player_chunk
+                && runtime.stream_distance == Some(distance)
+                && runtime.far_pending_chunks.is_empty()
+                && resident_near.len() == ((near_radius * 2 + 1).pow(2) as usize)
+            {
+                return false;
+            }
+        }
         let desired: HashSet<(i32, i32)> = (-distance..=distance)
             .flat_map(|dz| (-distance..=distance).map(move |dx| (dx, dz)))
             .map(|(dx, dz)| (player_chunk.0 + dx, player_chunk.1 + dz))
@@ -934,6 +955,7 @@ impl BoxcraftApp {
             runtime.build_queue.retain(|chunk| queued.contains(chunk));
         }
         runtime.player_chunk = player_chunk;
+        runtime.stream_distance = Some(distance);
         let current_far_set: HashSet<(i32, i32)> = runtime.far_chunks.iter().copied().collect();
         if current_far_set != far_set {
             runtime.far_chunks = far;
@@ -969,7 +991,7 @@ impl BoxcraftApp {
             .into_iter()
             .filter(|chunk| {
                 near.contains(chunk)
-                    && !self.near_meshes.get().contains_key(chunk)
+                    && !resident_near.contains_key(chunk)
                     && !runtime.queued_chunks.contains(chunk)
             })
             .collect();
@@ -1299,7 +1321,8 @@ impl BoxcraftApp {
             } else {
                 1.0
             };
-            let mut vertices = Vec::new();
+            let mut vertices =
+                Vec::with_capacity(core_meshes.iter().map(|mesh| mesh.indices.len()).sum());
             for core_mesh in core_meshes {
                 append_lit_vertices(&core_mesh, daylight, &mut vertices);
             }
@@ -1461,25 +1484,37 @@ impl BoxcraftApp {
     fn rebuild_lighting_meshes(&self) -> bool {
         let mut rebuilt = false;
         let core_meshes = self.near_core_meshes.get();
-        for (key, core_mesh) in core_meshes
-            .iter()
-            .filter(|(_, core_mesh)| mesh_has_block_light(core_mesh))
-        {
-            rebuilt |= self.update_near_mesh_from_core(*key, core_mesh);
+        for (key, mesh) in self.near_meshes.get().iter() {
+            if mesh.has_block_light {
+                if let Some(core_mesh) = core_meshes.get(key) {
+                    rebuilt |= self.update_near_mesh_from_core(*key, core_mesh);
+                }
+            }
         }
         rebuilt | self.rebuild_block_lit_far_meshes()
     }
 
     fn rebuild_block_lit_far_meshes(&self) -> bool {
+        let lit_groups: HashSet<(i32, i32)> = self
+            .far_meshes
+            .get()
+            .iter()
+            .filter(|(_, mesh)| mesh.has_block_light)
+            .map(|(group, _)| *group)
+            .collect();
+        if lit_groups.is_empty() {
+            return false;
+        }
         let mut groups: HashMap<(i32, i32), Vec<Arc<boxcraft_core::Mesh>>> = HashMap::new();
         for (chunk, core_mesh) in self.far_core_meshes.get().iter() {
             let group = (
                 chunk.0.div_euclid(FAR_MESH_GROUP_SIZE),
                 chunk.1.div_euclid(FAR_MESH_GROUP_SIZE),
             );
-            groups.entry(group).or_default().push(Arc::clone(core_mesh));
+            if lit_groups.contains(&group) {
+                groups.entry(group).or_default().push(Arc::clone(core_mesh));
+            }
         }
-        groups.retain(|_, meshes| meshes.iter().any(|mesh| mesh_has_block_light(mesh)));
         if groups.is_empty() {
             return false;
         }
@@ -1498,7 +1533,8 @@ impl BoxcraftApp {
                     FAR_MESH_GROUP_SIZE,
                 ),
             );
-            let mut vertices = Vec::new();
+            let mut vertices =
+                Vec::with_capacity(core_meshes.iter().map(|mesh| mesh.indices.len()).sum());
             for core_mesh in core_meshes {
                 append_lit_vertices(&core_mesh, daylight, &mut vertices);
             }
@@ -1553,13 +1589,11 @@ impl BoxcraftApp {
         let daylight = sunlight_daylight(sun_phase);
         let far_meshes = self.presented_far_meshes.get();
         let near_meshes = self.presented_near_meshes.get();
+        let frustum = Frustum::from_transform(transform, self.canvas_aspect.get());
         let mut candidates: Vec<Arc<TerrainMesh>> = near_meshes
             .values()
             .chain(far_meshes.values())
-            .filter(|mesh| {
-                mesh.triangle_count() > 0
-                    && chunk_is_visible(camera.position, camera.forward(), mesh.bounds, far_plane)
-            })
+            .filter(|mesh| mesh.triangle_count() > 0 && frustum.intersects(mesh.bounds))
             .cloned()
             .collect();
         candidates.sort_by(|left, right| {
@@ -1609,6 +1643,7 @@ impl BoxcraftApp {
         let distance_down = self.clone();
         let distance_up = self.clone();
         let settings_close = self.clone();
+        let canvas_geometry = self.clone();
         let pointer_locked = self.pointer_lock_applied.get();
         let fullscreen_desired = self.fullscreen_desired.get();
         let settings_open = self.settings_visible.get();
@@ -1648,7 +1683,19 @@ impl BoxcraftApp {
             self.canvas_frame.clone(),
         )
         .placeholder(sky_color(self.sun_phase.get()))
-        .frame(f32::INFINITY, f32::INFINITY);
+        .frame(f32::INFINITY, f32::INFINITY)
+        .on_geometry_change(
+            |geometry| geometry.size(),
+            move |size| {
+                if size.width > 0.0 && size.height > 0.0 {
+                    let aspect = size.width / size.height;
+                    if aspect.is_finite() && canvas_geometry.canvas_aspect.get() != aspect {
+                        canvas_geometry.canvas_aspect.set(aspect);
+                        canvas_geometry.refresh_frame();
+                    }
+                }
+            },
+        );
         let game_area = zstack! {
             canvas,
             Text::new("+").font_size(28.0).color(Color::rgb(0.95, 0.95, 0.98)),
@@ -1931,6 +1978,13 @@ fn build_boxcraft_content(app: &BoxcraftApp) -> Box<dyn View> {
 /// a process-local sequence and an address-derived value. The latter keeps the
 /// fallback useful on guests without an initialized RTC as well.
 fn random_world_seed() -> u64 {
+    let requested_seed = std::env::args()
+        .skip_while(|arg| arg != "--seed")
+        .nth(1)
+        .or_else(|| std::env::var("BOXCRAFT_SEED").ok());
+    if let Some(seed) = requested_seed.and_then(|value| value.parse::<u64>().ok()) {
+        return seed;
+    }
     let os_entropy = platform_entropy_u64();
     let clock = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1992,6 +2046,7 @@ fn append_lit_vertices(
     daylight: f32,
     vertices: &mut Vec<SgfxCanvasVertex>,
 ) {
+    vertices.reserve(core_mesh.indices.len());
     for triangle in core_mesh.indices.chunks_exact(3) {
         let [first, second, third] = triangle else {
             continue;
@@ -2462,13 +2517,48 @@ fn mesh_distance_sq(bounds: MeshBounds, camera_position: Vec3) -> f32 {
     offset.dot(offset)
 }
 
-/// Return whether a mesh's world-space AABB can intersect the camera frustum.
-///
-/// The old test used only a horizontal chunk centre and therefore ignored
-/// camera pitch, terrain height, and the actual mesh extents. This conservative
-/// AABB/frustum test uses the same vertical FOV and reference aspect as the
-/// projection, so rotating the camera and the visible chunk set agree.
-fn chunk_is_visible(
+/// Six clip planes, extracted once per frame from the rendering transform.
+struct Frustum {
+    planes: [[f32; 4]; 6],
+}
+
+impl Frustum {
+    fn from_transform(transform: [f32; 16], canvas_aspect: f32) -> Self {
+        // Match SGFX's horizontal correction for the canvas's laid-out size.
+        let x_scale = REFERENCE_ASPECT / canvas_aspect;
+        let rows: [[f32; 4]; 4] = core::array::from_fn(|row| {
+            core::array::from_fn(|column| {
+                transform[column * 4 + row] * if row == 0 { x_scale } else { 1.0 }
+            })
+        });
+        Self {
+            planes: core::array::from_fn(|plane| {
+                let sign = if plane % 2 == 0 { 1.0 } else { -1.0 };
+                core::array::from_fn(|component| {
+                    rows[3][component] + sign * rows[plane / 2][component]
+                })
+            }),
+        }
+    }
+
+    fn intersects(&self, bounds: MeshBounds) -> bool {
+        self.planes.iter().all(|&[x, y, z, distance]| {
+            // Test the corner farthest into each plane's visible half-space.
+            // Unlike separate horizontal/depth radii, this keeps correlation
+            // between axes and rejects large offscreen groups at oblique angles.
+            let support = Vec3::new(
+                if x >= 0.0 { bounds.max.x } else { bounds.min.x },
+                if y >= 0.0 { bounds.max.y } else { bounds.min.y },
+                if z >= 0.0 { bounds.max.z } else { bounds.min.z },
+            );
+            x * support.x + y * support.y + z * support.z + distance >= -0.001
+        })
+    }
+}
+
+/// Previous conservative test, retained for comparison measurements.
+#[cfg(test)]
+fn previous_chunk_is_visible(
     camera_position: Vec3,
     camera_forward: Vec3,
     bounds: MeshBounds,
@@ -2515,6 +2605,116 @@ fn chunk_is_visible(
 mod tests {
     use super::*;
 
+    fn settle_terrain(app: &BoxcraftApp) {
+        let deadline = Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            app.process_mesh_results();
+            app.refresh_chunk_set();
+            app.dispatch_near_mesh_jobs();
+            app.dispatch_far_mesh_job_if_settled();
+            let settled = {
+                let runtime = app.runtime.lock().unwrap();
+                runtime.build_queue.is_empty()
+                    && runtime.in_flight_chunks.is_empty()
+                    && runtime.edit_job_in_flight.is_none()
+                    && !runtime.far_dirty
+            };
+            if settled {
+                break;
+            }
+            assert!(Instant::now() < deadline, "streaming did not settle");
+            std::thread::yield_now();
+        }
+        app.refresh_frame_if_terrain_ready();
+    }
+
+    #[test]
+    fn resident_streaming_handles_movement_distance_and_edits() {
+        let app = BoxcraftApp::with_seed(7);
+        settle_terrain(&app);
+        let before = app.near_meshes.get();
+        let generation = app.runtime.lock().unwrap().far_generation;
+        app.with_game(|game| game.player.look(0.4, 0.0));
+        assert!(!app.refresh_chunk_set());
+        assert!(Arc::ptr_eq(&before, &app.near_meshes.get()));
+        assert_eq!(app.runtime.lock().unwrap().far_generation, generation);
+
+        app.with_game(|game| game.player.position.x += CHUNK_SIZE as f32);
+        assert!(app.refresh_chunk_set());
+        settle_terrain(&app);
+        assert!(app.runtime.lock().unwrap().far_generation > generation);
+
+        app.render_distance.set(1);
+        assert!(app.refresh_chunk_set());
+        settle_terrain(&app);
+        assert_eq!(app.near_meshes.get().len(), 9);
+        assert!(app.runtime.lock().unwrap().far_chunks.is_empty());
+
+        // An edit during loading clears the queue. Missing near chunks must
+        // still be rediscovered even when the player remains in the same cell.
+        app.render_distance.set(3);
+        app.refresh_chunk_set();
+        let camera = app.with_game(|game| game.player.camera().position);
+        let position = IVec3::new(camera.x as i32, camera.y as i32, camera.z as i32);
+        app.submit_edit(EditRequest {
+            position,
+            block: Block::Torch,
+            topology_changed: false,
+        });
+        settle_terrain(&app);
+        assert_eq!(app.near_meshes.get().len(), 25);
+        assert!(
+            app.rebuild_lighting_meshes(),
+            "torch meshes must still rebake"
+        );
+
+        app.submit_edit(EditRequest {
+            position,
+            block: Block::Air,
+            topology_changed: false,
+        });
+        settle_terrain(&app);
+        assert!(
+            !app.rebuild_lighting_meshes(),
+            "removed torches must clear cached flags"
+        );
+        assert!(!app.refresh_chunk_set());
+    }
+
+    #[test]
+    #[ignore = "CPU benchmark; run with --ignored --nocapture"]
+    fn performance_idle_work() {
+        use std::hint::black_box;
+
+        let app = BoxcraftApp::with_seed(7);
+        settle_terrain(&app);
+        let start = Instant::now();
+        for _ in 0..10_000 {
+            app.with_game(|game| game.player.look(0.001, 0.0));
+            black_box(app.refresh_chunk_set());
+        }
+        println!(
+            "stream reconciliation: {:.2}us/tick",
+            start.elapsed().as_secs_f64() * 100.0
+        );
+        let start = Instant::now();
+        for _ in 0..100 {
+            black_box(app.rebuild_lighting_meshes());
+        }
+        println!(
+            "lighting refresh: {:.2}us/tick",
+            start.elapsed().as_secs_f64() * 10_000.0
+        );
+        let start = Instant::now();
+        for _ in 0..10_000 {
+            app.refresh_frame();
+        }
+        println!(
+            "frame preparation: {:.2}us/tick",
+            start.elapsed().as_secs_f64() * 100.0
+        );
+    }
+
     #[test]
     fn completed_far_ring_stays_presented_until_the_replacement_is_ready() {
         assert!(should_hold_presented_terrain(true, true));
@@ -2529,17 +2729,141 @@ mod tests {
     }
 
     #[test]
+    fn frustum_matches_clip_space_and_resized_canvas() {
+        for aspect in [0.75, REFERENCE_ASPECT, 3.0] {
+            for yaw in [0.0, 0.6, 2.4] {
+                for pitch in [-1.5, 0.0, 0.9] {
+                    let camera = boxcraft_core::Camera {
+                        position: Vec3::new(120.0, 40.0, 160.0),
+                        yaw,
+                        pitch,
+                    };
+                    let transform =
+                        Mat4::perspective_rh_gl(CAMERA_FOV, REFERENCE_ASPECT, 0.05, 128.0)
+                            .mul_mat4(camera.view_matrix())
+                            .columns;
+                    let frustum = Frustum::from_transform(transform, aspect);
+                    let mut random = 42_u32;
+                    for _ in 0..500 {
+                        let mut next = || {
+                            random = random.wrapping_mul(1664525).wrapping_add(1013904223);
+                            (random >> 16) as f32 / 65535.0
+                        };
+                        let min = Vec3::new(next() * 300.0, next() * 100.0, next() * 300.0);
+                        let bounds = MeshBounds {
+                            min,
+                            max: min + Vec3::new(next() * 64.0, next() * 64.0, next() * 64.0),
+                        };
+                        // Independent reference: transform all eight corners,
+                        // then reject only when all lie outside one clip plane.
+                        let mut maxima = [f32::NEG_INFINITY; 6];
+                        for x in [bounds.min.x, bounds.max.x] {
+                            for y in [bounds.min.y, bounds.max.y] {
+                                for z in [bounds.min.z, bounds.max.z] {
+                                    let mut clip: [f32; 4] = core::array::from_fn(|row| {
+                                        transform[row] * x
+                                            + transform[4 + row] * y
+                                            + transform[8 + row] * z
+                                            + transform[12 + row]
+                                    });
+                                    clip[0] *= REFERENCE_ASPECT / aspect;
+                                    for plane in 0..6 {
+                                        let distance = clip[3]
+                                            + if plane % 2 == 0 {
+                                                clip[plane / 2]
+                                            } else {
+                                                -clip[plane / 2]
+                                            };
+                                        maxima[plane] = maxima[plane].max(distance);
+                                    }
+                                }
+                            }
+                        }
+                        if maxima.iter().all(|value| *value >= 0.0) {
+                            assert!(frustum.intersects(bounds), "visible bounds were culled");
+                        }
+                        if maxima.iter().any(|value| *value < -0.01) {
+                            assert!(
+                                !frustum.intersects(bounds),
+                                "offscreen bounds were retained"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "Draw workload comparison; run with --ignored --nocapture"]
+    fn performance_draw_workload() {
+        for seed in [7, 11, 42] {
+            let app = BoxcraftApp::with_seed(seed);
+            settle_terrain(&app);
+            let near = app.presented_near_meshes.get();
+            let far = app.presented_far_meshes.get();
+            let mut old_draws = 0_usize;
+            let mut new_draws = 0_usize;
+            let mut old_triangles = 0_usize;
+            let mut new_triangles = 0_usize;
+            let far_plane = camera_far_plane(DEFAULT_RENDER_DISTANCE);
+            for pitch in [-0.8, 0.0, 0.8] {
+                for step in 0..24 {
+                    let camera = app.with_game(|game| boxcraft_core::Camera {
+                        yaw: step as f32 * core::f32::consts::TAU / 24.0,
+                        pitch,
+                        ..game.player.camera()
+                    });
+                    let transform =
+                        Mat4::perspective_rh_gl(CAMERA_FOV, REFERENCE_ASPECT, 0.05, far_plane)
+                            .mul_mat4(camera.view_matrix())
+                            .columns;
+                    let frustum = Frustum::from_transform(transform, REFERENCE_ASPECT);
+                    for mesh in near.values().chain(far.values()) {
+                        if mesh.triangle_count() == 0 {
+                            continue;
+                        }
+                        if previous_chunk_is_visible(
+                            camera.position,
+                            camera.forward(),
+                            mesh.bounds,
+                            far_plane,
+                        ) {
+                            old_draws += 1;
+                            old_triangles += mesh.triangle_count();
+                        }
+                        if frustum.intersects(mesh.bounds) {
+                            new_draws += 1;
+                            new_triangles += mesh.triangle_count();
+                        }
+                    }
+                }
+            }
+            println!(
+                "seed={seed} views=72 draws={old_draws}->{new_draws} triangles={old_triangles}->{new_triangles}"
+            );
+        }
+    }
+
+    #[test]
     fn chunk_containing_the_camera_is_never_angle_culled() {
         let camera = Vec3::new(8.0, 10.0, 8.0);
         let away_from_center = Vec3::new(-1.0, 0.0, -1.0).normalized();
         let bounds = MeshBounds::fallback(0, 0, 1);
-        assert!(chunk_is_visible(camera, away_from_center, bounds, 128.0));
+        let transform = Mat4::perspective_rh_gl(CAMERA_FOV, REFERENCE_ASPECT, 0.05, 128.0)
+            .mul_mat4(Mat4::look_at_rh(
+                camera,
+                camera + away_from_center,
+                Vec3::new(0.0, 1.0, 0.0),
+            ))
+            .columns;
+        assert!(Frustum::from_transform(transform, REFERENCE_ASPECT).intersects(bounds));
     }
 
     #[test]
     fn chunk_culling_uses_the_camera_vertical_fov() {
-        let camera = Vec3::zero();
-        let forward = Vec3::new(0.0, 0.0, -1.0);
+        let transform = Mat4::perspective_rh_gl(CAMERA_FOV, REFERENCE_ASPECT, 0.05, 128.0).columns;
+        let frustum = Frustum::from_transform(transform, REFERENCE_ASPECT);
         let centered = MeshBounds {
             min: Vec3::new(-1.0, -1.0, -21.0),
             max: Vec3::new(1.0, 1.0, -19.0),
@@ -2548,8 +2872,14 @@ mod tests {
             min: Vec3::new(-1.0, 20.0, -21.0),
             max: Vec3::new(1.0, 22.0, -19.0),
         };
-        assert!(chunk_is_visible(camera, forward, centered, 128.0));
-        assert!(!chunk_is_visible(camera, forward, high, 128.0));
+        assert!(frustum.intersects(centered));
+        assert!(!frustum.intersects(high));
+        let wide_edge = MeshBounds {
+            min: Vec3::new(39.0, -1.0, -21.0),
+            max: Vec3::new(41.0, 1.0, -19.0),
+        };
+        assert!(!frustum.intersects(wide_edge));
+        assert!(Frustum::from_transform(transform, 3.0).intersects(wide_edge));
     }
 
     #[test]

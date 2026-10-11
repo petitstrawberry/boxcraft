@@ -9,11 +9,11 @@ license = "MIT"
 boxcraft-core = { path = "../boxcraft-core" }
 
 [target.'cfg(target_os = "scarlet")'.dependencies]
-scarlet-ui = { git = "https://github.com/petitstrawberry/scarlet-ui", rev = "0307788d09f7e5a439706d00e05308d430767f39", package = "scarlet-ui", default-features = false, features = ["std", "platform-sws"] }
+scarlet-ui = { git = "https://github.com/petitstrawberry/scarlet-ui", rev = "62da5fd4fcb7dff3986712aaf704f044ca0ce931", package = "scarlet-ui", default-features = false, features = ["std", "platform-sws"] }
 scarlet-sys = { git = "https://github.com/petitstrawberry/Scarlet", rev = "d3b1c05127d4df3616f988b81a99f616e8a88064", package = "scarlet-sys" }
 
 [target.'cfg(not(target_os = "scarlet"))'.dependencies]
-scarlet-ui = { git = "https://github.com/petitstrawberry/scarlet-ui", rev = "0307788d09f7e5a439706d00e05308d430767f39", package = "scarlet-ui", default-features = false, features = ["std", "platform-winit"] }
+scarlet-ui = { git = "https://github.com/petitstrawberry/scarlet-ui", rev = "62da5fd4fcb7dff3986712aaf704f044ca0ce931", package = "scarlet-ui", default-features = false, features = ["std", "platform-winit"] }
 
 [[bin]]
 name = "boxcraft"
